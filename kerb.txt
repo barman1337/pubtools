@@ -144,7 +144,7 @@ function Get-KerberosTicketsForAllSPNs {
             try {
                 $ticket = [K]::GetTicket($spn)
             } catch {
-                Write-Warning "Failed to request ticket for $spn: $_"
+                Write-Warning ("Failed to request ticket for $spn: " + $_)
             }
 
             [pscustomobject]@{
