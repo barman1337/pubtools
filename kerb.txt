@@ -132,7 +132,7 @@ function Get-KerberosTicketsForAllSPNs {
 
     foreach ($user in $users) {
         foreach ($spn in $user.ServicePrincipalName) {
-            Write-Host "  → $spn"
+            Write-Host "  → ${spn}"
 
             try {
                 $ticket = [K]::GetTicket($spn)
@@ -142,7 +142,7 @@ function Get-KerberosTicketsForAllSPNs {
                     TicketHex      = $ticket
                 }
             } catch {
-                Write-Warning ("Failed to request ticket for")
+                Write-Warning ("Failed to request ticket for ${spn}: " + $_)
             }
         }
     }
