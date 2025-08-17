@@ -134,15 +134,15 @@ function Get-KerberosTicketBySamAccountName {
 
         foreach ($spn in $user.servicePrincipalName) {
             try {
-                Write-Host "Requesting ticket for SPN: $spn"
+                Write-Host "Requesting ticket for SPN: ${spn}"
                 $ticket = [K]::GetTicket($spn)
                 if ($ticket) {
-                    Write-Output "Kerberos TGS ticket (hex) for $spn:`n$ticket"
+                    Write-Output "Kerberos TGS ticket (hex) for ${spn}:`n$ticket"
                 } else {
-                    Write-Warning "Failed to retrieve ticket for $spn."
+                    Write-Warning "Failed to retrieve ticket for ${spn}."
                 }
             } catch {
-                Write-Warning "Error for $spn: $_"
+                Write-Warning "Error for ${spn}: $_"
             }
         }
     } catch {
