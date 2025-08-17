@@ -1,3 +1,4 @@
+# STEP 1: Load C# class to get Kerberos TGS tickets
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -59,7 +60,7 @@ public class K {
         uint attr = 0;
 
         SecBuffer secBuf = new SecBuffer();
-        secBuf.BufferType = 2; // SECBUFFER_TOKEN
+        secBuf.BufferType = 2;
         secBuf.cbBuffer = 0;
         secBuf.pvBuffer = IntPtr.Zero;
 
@@ -72,31 +73,10 @@ public class K {
             desc.cBuffers = 1;
             desc.pBuffers = bufPtr;
 
-            if (AcquireCredentialsHandle(
-                    null,
-                    "Kerberos",
-                    0x00000002, // SECPKG_CRED_OUTBOUND
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    out cred,
-                    out expiry1) != 0)
+            if (AcquireCredentialsHandle(null, "Kerberos", 0x00000002, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, out expiry1) != 0)
                 return "";
 
-            if (InitializeSecurityContext(
-                    cred,
-                    IntPtr.Zero,
-                    spn,
-                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
-                    0,
-                    16,
-                    IntPtr.Zero,
-                    0,
-                    out ctx,
-                    out desc,
-                    out attr,
-                    out expiry2) != 0)
+            if (InitializeSecurityContext(cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, out desc, out attr, out expiry2) != 0)
                 return "";
 
             SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
@@ -120,6 +100,7 @@ public class K {
 }
 "@
 
+# STEP 2: Query AD for service accounts with SPNs
 function Get-AdServiceAccountsV2 {
     [CmdletBinding()]
     Param(
@@ -193,18 +174,6 @@ function Get-AdServiceAccountsV2 {
                 $obj | Add-Member NoteProperty LastLogonTimestamp ([datetime]::FromFileTime([int64]$z['lastlogontimestamp'][0]))
             }
 
-            # Attempt to retrieve ticket
-            if ($z['serviceprincipalname']) {
-                foreach ($spn in $z['serviceprincipalname']) {
-                    try {
-                        $ticket = [K]::GetTicket($spn)
-                        if ($ticket -and $ticket.Length -gt 0) {
-                            $obj | Add-Member NoteProperty KerberosTicket $ticket
-                        }
-                    } catch { }
-                }
-            }
-
             $obj
         }
     } finally {
@@ -212,4 +181,66 @@ function Get-AdServiceAccountsV2 {
         if ($de) { $de.Dispose() }
         if ($results) { $results.Dispose() }
     }
+}
+
+# STEP 3: Request TGS tickets for all SPNs
+function Get-KerberosTicketsForAllSPNs {
+    [CmdletBinding()]
+    Param(
+        [switch]$OnlySuccess,
+        [switch]$ExportToCsv,
+        [string]$CsvPath = ".\kerberos_tickets.csv",
+        [string]$Domain,
+        [string]$Scope = "Subtree"
+    )
+
+    $accounts = Get-AdServiceAccountsV2 -Domain:$Domain -Scope:$Scope
+    $results = @()
+
+    foreach ($acct in $accounts) {
+        $sam = $acct.SamAccountName
+        $dn  = $acct.DistinguishedName
+        $spns = $acct.ServicePrincipalName
+
+        foreach ($spn in $spns) {
+            try {
+                Write-Host "Requesting TGS for SPN: $spn" -ForegroundColor Cyan
+                $ticket = [K]::GetTicket($spn)
+
+                $result = [PSCustomObject]@{
+                    SamAccountName     = $sam
+                    DistinguishedName  = $dn
+                    SPN                = $spn
+                    GotTicket          = $false
+                    TicketPreview      = ''
+                }
+
+                if ($ticket -and $ticket.Length -gt 0) {
+                    $result.GotTicket = $true
+                    $result.TicketPreview = $ticket.Substring(0, 48) + '...'
+                    Write-Host "[+] Success: $spn" -ForegroundColor Green
+                } else {
+                    Write-Host "[-] Failed : $spn" -ForegroundColor DarkGray
+                }
+
+                if (-not $OnlySuccess -or $result.GotTicket) {
+                    $results += $result
+                }
+
+            } catch {
+                Write-Warning "Exception for SPN $spn: $_"
+            }
+        }
+    }
+
+    if ($ExportToCsv) {
+        try {
+            $results | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CsvPath
+            Write-Host "`n[+] Exported to $CsvPath" -ForegroundColor Yellow
+        } catch {
+            Write-Warning "Failed to export results: $_"
+        }
+    }
+
+    return $results
 }
