@@ -3,22 +3,37 @@ using System;
 using System.Runtime.InteropServices;
 
 public class K {
-    [DllImport("secur32.dll")]
+    [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern int AcquireCredentialsHandle(
-        string pszPrincipal, string pszPackage, uint fCredentialUse,
-        IntPtr pvLogonId, IntPtr pAuthData, IntPtr pGetKeyFn, IntPtr pvGetKeyArgument,
-        out IntPtr phCredential, out IntPtr ptsExpiry);
+        string pszPrincipal,
+        string pszPackage,
+        uint fCredentialUse,
+        IntPtr pvLogonID,
+        IntPtr pAuthData,
+        IntPtr pGetKeyFn,
+        IntPtr pvGetKeyArgument,
+        out IntPtr phCredential,
+        out IntPtr ptsExpiry);
 
-    [DllImport("secur32.dll")]
+    [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern int InitializeSecurityContext(
-        IntPtr phCredential, IntPtr phContext, string pszTargetName, uint fContextReq,
-        uint Reserved1, uint TargetDataRep, IntPtr pInput, uint Reserved2,
-        out IntPtr phNewContext, out SecBufferDesc pOutput, out uint pfContextAttr, out IntPtr ptsExpiry);
+        IntPtr phCredential,
+        IntPtr phContext,
+        string pszTargetName,
+        uint fContextReq,
+        uint Reserved1,
+        uint TargetDataRep,
+        IntPtr pInput,
+        uint Reserved2,
+        out IntPtr phNewContext,
+        out SecBufferDesc pOutput,
+        out uint pfContextAttr,
+        out IntPtr ptsExpiry);
 
-    [DllImport("secur32.dll")]
+    [DllImport("secur32.dll", SetLastError = true)]
     public static extern int FreeCredentialsHandle(IntPtr phCredential);
 
-    [DllImport("secur32.dll")]
+    [DllImport("secur32.dll", SetLastError = true)]
     public static extern int FreeContextBuffer(IntPtr pvContextBuffer);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -38,6 +53,8 @@ public class K {
     public static string GetTicket(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
+        IntPtr expiry1 = IntPtr.Zero;
+        IntPtr expiry2 = IntPtr.Zero;
         IntPtr bufPtr = IntPtr.Zero;
         uint attr = 0;
 
@@ -46,34 +63,57 @@ public class K {
         secBuf.cbBuffer = 0;
         secBuf.pvBuffer = IntPtr.Zero;
 
-        bufPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecBuffer)));
-        Marshal.StructureToPtr(secBuf, bufPtr, false);
-
-        SecBufferDesc desc = new SecBufferDesc();
-        desc.ulVersion = 0;
-        desc.cBuffers = 1;
-        desc.pBuffers = bufPtr;
-
         try {
-            if (AcquireCredentialsHandle(null, "Kerberos", 0x00000002, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, IntPtr.Zero) != 0)
+            bufPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecBuffer)));
+            Marshal.StructureToPtr(secBuf, bufPtr, false);
+
+            SecBufferDesc desc = new SecBufferDesc();
+            desc.ulVersion = 0;
+            desc.cBuffers = 1;
+            desc.pBuffers = bufPtr;
+
+            if (AcquireCredentialsHandle(
+                    null,
+                    "Kerberos",
+                    0x00000002, // SECPKG_CRED_OUTBOUND
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    out cred,
+                    out expiry1) != 0)
                 return "";
 
-            if (InitializeSecurityContext(cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, out desc, out attr, IntPtr.Zero) != 0)
+            if (InitializeSecurityContext(
+                    cred,
+                    IntPtr.Zero,
+                    spn,
+                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
+                    0,
+                    16,
+                    IntPtr.Zero,
+                    0,
+                    out ctx,
+                    out desc,
+                    out attr,
+                    out expiry2) != 0)
                 return "";
 
-            SecBuffer outBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
-            if (outBuf.cbBuffer == 0 || outBuf.pvBuffer == IntPtr.Zero)
+            SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
+            if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
                 return "";
 
-            byte[] data = new byte[outBuf.cbBuffer];
-            Marshal.Copy(outBuf.pvBuffer, data, 0, data.Length);
+            byte[] data = new byte[resultBuf.cbBuffer];
+            Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
             return BitConverter.ToString(data).Replace("-", "");
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
-            if (desc.pBuffers != IntPtr.Zero) {
-                SecBuffer clean = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
-                if (clean.pvBuffer != IntPtr.Zero) FreeContextBuffer(clean.pvBuffer);
-                Marshal.FreeHGlobal(desc.pBuffers);
+            if (bufPtr != IntPtr.Zero) {
+                try {
+                    SecBuffer cleanup = (SecBuffer)Marshal.PtrToStructure(bufPtr, typeof(SecBuffer));
+                    if (cleanup.pvBuffer != IntPtr.Zero) FreeContextBuffer(cleanup.pvBuffer);
+                } catch { }
+                Marshal.FreeHGlobal(bufPtr);
             }
         }
     }
