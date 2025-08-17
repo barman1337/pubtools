@@ -141,11 +141,11 @@ function Get-KerberosTicketsForAllSPNs {
 
             # Skip known unsafe SPNs
             if ($spn -match "^kadmin/changepw") {
-                Write-Warning "Skipping unstable SPN: $spn"
+                Write-Warning "Skipping unstable SPN: ${spn}"
                 continue
             }
 
-            Write-Host "  → $spn" -ForegroundColor Yellow
+            Write-Host "  → ${spn}" -ForegroundColor Yellow
 
             try {
                 $ticket = [K]::GetTicket($spn)
@@ -156,12 +156,12 @@ function Get-KerberosTicketsForAllSPNs {
                         TicketHex       = $ticket
                     }
                 } else {
-                    Write-Warning "No ticket received for $spn"
+                    Write-Warning "No ticket received for ${spn}"
                 }
             } catch [System.AccessViolationException] {
-                Write-Warning "AccessViolationException: Unstable memory for SPN $spn. Skipping."
+                Write-Warning "AccessViolationException: Unstable memory for SPN ${spn}. Skipping."
             } catch {
-                Write-Warning ("Failed to request ticket for SPN `"$spn`": " + $_.Exception.Message)
+                Write-Warning ("Failed to request ticket for SPN `"${spn}`": " + $_.Exception.Message)
             }
         }
     }
