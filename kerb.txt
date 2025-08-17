@@ -155,7 +155,7 @@ function Get-KerberosTicketHashcatFormat {
             $realm = "$env:USERDNSDOMAIN"
             $spnSanitized = $spn.Replace(":", "~")
 
-            $hashcat = "\$krb5tgs\$${etype}*${userPart}\$${realm}\$${spnSanitized}*${checksumHex}\$${cipherHex}"
+            $hashcat = "$krb5tgs$${etype}*${userPart}$$${realm}$$${spnSanitized}*${checksumHex}$$${cipherHex}"
             Write-Host "[+] Hashcat Format:`n${hashcat}`n"
         }
         catch {
